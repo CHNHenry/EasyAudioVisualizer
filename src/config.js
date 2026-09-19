@@ -1,0 +1,187 @@
+// 配置持久化 + 设置页构建
+// 使用 BetterNCM 的 readConfig/writeConfig（HTTP 异步 API）
+const PREFIX = 'easyav.';
+
+export const DEFAULTS = {
+    sampleRate: '',      // '' = 自动取 AudioContext 采样率
+    fftSize: '1024',
+    startFrequency: '150',
+    endFrequency: '4500',
+    outBandsQty: '81',
+    tWeight: '1',
+    aWeight: '1',
+    filterOn: '1',
+    sigma: '1',
+    radius: '2',
+    multiFFT: '0',       // 多分辨率分体 8192/2048/512
+    maxHeight: '120'     // 柱形条群最大高度 px
+};
+
+async function readConf(key) {
+    try {
+        const v = await betterncm.app.readConfig(PREFIX + key, DEFAULTS[key]);
+        return v === undefined || v === null || v === '' ? DEFAULTS[key] : String(v);
+    } catch (e) {
+        return DEFAULTS[key];
+    }
+}
+
+export async function loadConfig() {
+    const cfg = {};
+    const keys = Object.keys(DEFAULTS);
+    await Promise.all(keys.map(async k => { cfg[k] = await readConf(k); }));
+    return cfg;
+}
+
+export function saveConfig(cfg, key) {
+    try {
+        betterncm.app.writeConfig(PREFIX + key, String(cfg[key]));
+    } catch (e) {
+        console.error('[EasyAudioVisualizer] writeConfig failed', key, e);
+    }
+}
+
+// ---------- 设置页 ----------
+function el(tag, style, text) {
+    const node = document.createElement(tag);
+    if (style) node.setAttribute('style', style);
+    if (text !== undefined) node.textContent = text;
+    return node;
+}
+
+function row(labelText, title, control) {
+    const r = el('div', 'display:flex;align-items:center;gap:8px;margin:6px 0;');
+    const label = el('label', 'flex:0 0 190px;font-size:13px;opacity:.85;cursor:default;', labelText);
+    label.title = title || '';
+    r.appendChild(label);
+    r.appendChild(control);
+    return r;
+}
+
+function input(value, attrs, onChange) {
+    const inp = el('input');
+    inp.value = value;
+    Object.assign(inp.style, {
+        flex: '1', minWidth: '0', padding: '4px 8px', fontSize: '13px',
+        background: 'rgba(255,255,255,.08)', color: 'inherit',
+        border: '1px solid rgba(255,255,255,.2)', borderRadius: '4px'
+    });
+    Object.entries(attrs || {}).forEach(([k, v]) => inp.setAttribute(k, v));
+    inp.addEventListener('change', () => onChange(inp.value));
+    return inp;
+}
+
+function checkbox(checked, onChange) {
+    const box = el('input');
+    box.type = 'checkbox';
+    box.checked = checked === '1' || checked === true;
+    box.style.flex = '0 0 auto';
+    box.addEventListener('change', () => onChange(box.checked ? '1' : '0'));
+    return box;
+}
+
+function select(value, options, onChange) {
+    const sel = el('select');
+    Object.assign(sel.style, {
+        flex: '1', padding: '4px 8px', fontSize: '13px',
+        background: 'rgba(255,255,255,.08)', color: 'inherit',
+        border: '1px solid rgba(255,255,255,.2)', borderRadius: '4px'
+    });
+    options.forEach(op => {
+        const o = el('option', '', op);
+        o.value = op;
+        if (String(op) === String(value)) o.selected = true;
+        sel.appendChild(o);
+    });
+    sel.addEventListener('change', () => onChange(sel.value));
+    return sel;
+}
+
+function numInput(cfg, key, attrs, viz) {
+    return input(cfg[key], attrs, v => {
+        cfg[key] = v;
+        saveConfig(cfg, key);
+        viz.rebuild();
+    });
+}
+
+function checkInput(cfg, key, viz, after) {
+    return checkbox(cfg[key], v => {
+        cfg[key] = v;
+        saveConfig(cfg, key);
+        viz.rebuild();
+        if (after) after();
+    });
+}
+
+export function buildPanel(cfg, viz) {
+    const root = el('div', 'padding:12px;max-width:560px;');
+    root.appendChild(el('div', 'font-size:15px;font-weight:600;margin-bottom:8px;', 'EasyAudioVisualizer 设置'));
+    root.appendChild(el('div', 'font-size:12px;opacity:.6;margin-bottom:10px;',
+        '所有参数即时生效（重建处理器，不影响播放）。悬停查看各项说明。'));
+
+    // 音频基础
+    root.appendChild(row('sampleRate 采样率',
+        '参与计算频点带宽与倍频程索引，留空自动取 AudioContext 真实采样率（推荐）',
+        numInput(cfg, 'sampleRate', { type: 'number', min: '8000', max: '192000', step: '100', placeholder: '留空自动' }, viz)));
+    root.appendChild(row('fftSize',
+        'FFT 窗口大小：越大低频越细但响应越慢；multiFFT 开启时忽略此项',
+        select(cfg.fftSize, ['256', '512', '1024', '2048', '4096', '8192'], v => {
+            cfg.fftSize = v;
+            saveConfig(cfg, 'fftSize');
+            viz.rebuild();
+        })));
+    root.appendChild(row('startFrequency (Hz)',
+        '倍频程起始频率，取该频率以上信号；不能为 0，否则输出全为 NaN',
+        numInput(cfg, 'startFrequency', { type: 'number', min: '0', step: '10' }, viz)));
+    root.appendChild(row('endFrequency (Hz)',
+        '倍频程截止频率上限；一般音乐建议 50~10000',
+        numInput(cfg, 'endFrequency', { type: 'number', min: '1', step: '100' }, viz)));
+    root.appendChild(row('outBandsQty 输出频带数',
+        '可视化柱子数量；越大细节多但单带能量弱',
+        numInput(cfg, 'outBandsQty', { type: 'number', min: '1', max: '512', step: '1' }, viz)));
+
+    root.appendChild(el('hr', 'border:none;border-top:1px solid rgba(255,255,255,.15);margin:10px 0;'));
+
+    // 开关
+    const fftSel = null; // fftSize select 的禁用联动通过重开设置页或下次 rebuild 生效
+    root.appendChild(row('tWeight 时间计权', '对最近 5 帧取平均，画面更平滑有拖尾；关闭则更硬朗',
+        checkInput(cfg, 'tWeight', viz)));
+    root.appendChild(row('aWeight A计权', '模拟人耳频率敏感度：压低频、突出中频（人声区）',
+        checkInput(cfg, 'aWeight', viz)));
+    root.appendChild(row('filterOn 高斯滤波', '抹平相邻频点突刺，画面更圆润；关闭更锐利',
+        checkInput(cfg, 'filterOn', viz)));
+    root.appendChild(row('multiFFT 多分辨率分体', '低频走 8192 求清晰、高频走 512 求迅速（恒Q近似）；开启后忽略 fftSize 与高斯滤波',
+        checkInput(cfg, 'multiFFT', viz)));
+    root.appendChild(row('maxHeight 最大高度 (px)', '柱形条群的最大显示高度',
+        input(cfg.maxHeight, { type: 'number', min: '40', max: '400', step: '4' }, v => {
+            cfg.maxHeight = v;
+            saveConfig(cfg, 'maxHeight');
+            viz.setMaxHeight(parseFloat(v) || 120);
+        })));
+
+    // 滤波参数
+    root.appendChild(row('sigma', '高斯 σ：越大平滑越强，过大会抹平细节（0.1~250）',
+        numInput(cfg, 'sigma', { type: 'number', min: '0.1', max: '250', step: '0.1' }, viz)));
+    root.appendChild(row('radius 滤波半径', '卷积核半径（核长 2r+1），0 相当于不滤波',
+        numInput(cfg, 'radius', { type: 'number', min: '0', max: '20', step: '1' }, viz)));
+
+    root.appendChild(el('hr', 'border:none;border-top:1px solid rgba(255,255,255,.15);margin:10px 0;'));
+
+    // 恢复默认
+    const resetBtn = el('button', 'padding:5px 14px;font-size:13px;cursor:pointer;background:rgba(255,255,255,.1);color:inherit;border:1px solid rgba(255,255,255,.25);border-radius:4px;', '恢复默认');
+    resetBtn.addEventListener('click', () => {
+        Object.keys(DEFAULTS).forEach(k => {
+            cfg[k] = DEFAULTS[k];
+            saveConfig(cfg, k);
+        });
+        viz.rebuild();
+        viz.setMaxHeight(parseFloat(cfg.maxHeight) || 120);
+        // 重建面板内容
+        const fresh = buildPanel(cfg, viz);
+        root.replaceWith(fresh);
+    });
+    root.appendChild(resetBtn);
+
+    return root;
+}

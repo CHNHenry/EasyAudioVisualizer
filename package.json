@@ -1,0 +1,12 @@
+{
+    "name": "easy-audio-visualizer",
+    "version": "0.1.0",
+    "description": "BetterNCM plugin: scientifically processed audio spectrum visualization on NCM play page",
+    "private": true,
+    "scripts": {
+        "build": "node build.mjs"
+    },
+    "devDependencies": {
+        "esbuild": "^0.20.0"
+    }
+}
