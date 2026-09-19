@@ -19,15 +19,69 @@ function detectLFP() {
 // 诊断信息落盘，便于远程排查（写入 BetterNCM 数据目录 eav-debug.json）
 const diag = {
     time: '',
+    href: '',
     lfpDetected: false,
+    lfpProbe: null,
     mediaElements: [],
     source: null,   // 'lfp' | 'element' | 'none' | null(仍在等待)
     anchor: null,
+    anchorMode: null,
     frames: 0,
+    viewport: null,
+    domProbe: null,
     errors: []
 };
 
+// DOM 结构探针：收集 id、疑似进度条/播放条元素，用于远程适配选择器
+function probeDom() {
+    try {
+        const pick = el => ({
+            tag: el.tagName.toLowerCase(),
+            id: el.id || undefined,
+            cls: String(el.className && el.className.baseVal === undefined ? el.className : '').slice(0, 80) || undefined,
+            rect: (r => ({ t: Math.round(r.top), h: Math.round(r.height), w: Math.round(r.width) }))(el.getBoundingClientRect())
+        });
+        const ids = Array.from(document.querySelectorAll('[id]')).slice(0, 60).map(el => el.id);
+        const barish = Array.from(document.querySelectorAll(
+            '[class*="prg" i],[class*="progress" i],[class*="slider" i],[role="slider"],[class*="player" i],[class*="btm" i],[class*="bar" i]'
+        )).slice(0, 60).map(pick);
+        const bodyChildren = Array.from(document.body ? document.body.children : []).slice(0, 20).map(pick);
+        diag.domProbe = { ids, barish, bodyChildren };
+        diag.href = String(location.href).slice(0, 120);
+        diag.viewport = { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio || 1 };
+    } catch (e) {
+        diag.errors.push('probe: ' + e);
+    }
+}
+
+// 探测 LFP 音频管线是否真的激活（hijack 在 NCM3 上是否生效）
+function probeLFP() {
+    try {
+        if (typeof loadedPlugins === 'undefined' || !loadedPlugins.LibFrontendPlay) return;
+        const L = loadedPlugins.LibFrontendPlay;
+        diag.lfpProbe = {
+            hasCtx: !!L.currentAudioContext,
+            hasPlayer: !!L.currentAudioPlayer,
+            playState: L.info ? L.info.playState : undefined,
+            url: L.info ? String(L.info.url || '').slice(0, 80) : undefined,
+            fftLen: (() => {
+                try {
+                    const d = L.getFFTData();
+                    return d ? d.length : -1;
+                } catch (e) {
+                    return 'ERR: ' + e;
+                }
+            })()
+        };
+    } catch (e) {
+        diag.errors.push('lfpProbe: ' + e);
+    }
+}
+
 function flushDiag() {
+    diag.time = new Date().toISOString();
+    probeDom();
+    probeLFP();
     const s = JSON.stringify(diag, null, 2);
     // 1) 同步 native API（最可靠）
     try {
@@ -150,46 +204,70 @@ export function createVisualizer(cfg) {
     }
 
     // ---------- 锚点定位：播放页进度条上方，左右无留白 ----------
+    // 返回 { rect, mode }；mode 记录用了哪条策略（进诊断）
     function findAnchor() {
-        // 播放页（全屏正在播放页）；.g-singlec-ct 为 SAV 验证过的播放页容器
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+
+        // 1) 播放页（全屏正在播放页）
         const playPage = document.querySelector('.g-singlec-ct, .g-playpage, [class*="playpage" i], #playpage');
         if (playPage) {
             const rect = playPage.getBoundingClientRect();
             if (rect.width > 0 && rect.height > 0) {
-                // 在播放页里找进度条：横向够宽、位于页面下部、尽量矮（排除容器）
-                const candidates = Array.from(playPage.querySelectorAll('[class*="prg"], [class*="progress"], [class*="bar"]'));
+                // 在播放页里找进度条：横向够宽、位于页面下部、矮条（排除容器）
+                const candidates = Array.from(playPage.querySelectorAll('[class*="prg"], [class*="progress"], [class*="bar"], [role="slider"]'));
                 const bars = candidates
                     .map(el => ({ el, rect: el.getBoundingClientRect() }))
                     .filter(x => x.rect.width > rect.width * 0.35
                         && x.rect.height > 2
-                        && x.rect.top > rect.top + rect.height * 0.55
-                        && x.rect.bottom < rect.bottom + 8);
+                        && x.rect.height < 120
+                        && x.rect.top > rect.top + rect.height * 0.55);
                 if (bars.length) {
                     bars.sort((a, b) => a.rect.height - b.rect.height);
-                    return bars[0].rect;
+                    return { rect: bars[0].rect, mode: 'playpage-bar' };
                 }
                 // 兜底：贴播放页底部
-                return { left: rect.left, top: rect.bottom - 40, width: rect.width };
+                return { rect: { left: rect.left, top: rect.bottom - 40, width: rect.width }, mode: 'playpage-bottom' };
             }
         }
-        // 兜底：底部播放栏
+
+        // 2) 全局搜疑似进度条/滑块（NCM3 类名未知，按几何特征筛）
+        const global = Array.from(document.querySelectorAll('[class*="prg" i],[class*="progress" i],[role="slider"],[class*="slider" i]'))
+            .map(el => el.getBoundingClientRect())
+            .filter(r => r.width > vw * 0.3 && r.height > 2 && r.height < 120 && r.top > vh * 0.5);
+        if (global.length) {
+            global.sort((a, b) => a.height - b.height);
+            return { rect: global[0], mode: 'global-slider' };
+        }
+
+        // 3) 兜底：底部播放栏（NCM2 类名）
         const bottomBar = document.querySelector('#main-player') || document.querySelector('.g-btmbar');
         if (bottomBar) {
             const rect = bottomBar.getBoundingClientRect();
             if (rect.height > 0) {
-                return { left: rect.left, top: rect.top, width: rect.width };
+                return { rect: { left: rect.left, top: rect.top, width: rect.width }, mode: 'bottombar' };
             }
+        }
+
+        // 4) 最终兜底：视口底部 60px（保证可见，之后靠 domProbe 精调）
+        if (vh > 200) {
+            return { rect: { left: 0, top: vh - 60, width: vw }, mode: 'viewport-fallback' };
         }
         return null;
     }
 
     function syncPosition() {
-        const rect = findAnchor();
-        if (!rect) {
+        const found = findAnchor();
+        if (!found) {
             wrap.style.display = 'none';
+            diag.anchor = null;
+            diag.anchorMode = null;
             return;
         }
+        const rect = found.rect;
         state.anchor = rect;
+        diag.anchor = { t: Math.round(rect.top), h: Math.round(rect.height), w: Math.round(rect.width) };
+        diag.anchorMode = found.mode;
         wrap.style.display = 'block';
         wrap.style.left = rect.left + 'px';
         wrap.style.width = rect.width + 'px';
@@ -370,11 +448,16 @@ export function createVisualizer(cfg) {
 
     function frame() {
         requestAnimationFrame(frame);
-        if (wrap.style.display === 'none') return;
+        if (wrap.style.display === 'none') {
+            // 定位失败也不会永远卡死：每秒重试定位
+            setTimeout(syncPosition, 1000);
+            return;
+        }
 
         // 锚点位置每帧跟随（页面切换时进度条会移动）
-        const live = findAnchor();
-        if (live) {
+        const found = findAnchor();
+        if (found) {
+            const live = found.rect;
             state.anchor = live;
             wrap.style.left = live.left + 'px';
             wrap.style.width = live.width + 'px';
@@ -430,8 +513,11 @@ export function createVisualizer(cfg) {
         start() {
             attachWhenBody();
             initData();
-            // 画布随时待命：找到锚点就显示（哪怕还没有数据源，先画基线示意）
+            // 画布随时待命：找到锚点就显示（没有数据源时画基线示意）
             setTimeout(syncPosition, 1000);
+            // 定位失败时的持续重试 + 周期性诊断落盘
+            setInterval(syncPosition, 1500);
+            setInterval(flushDiag, 10000);
         },
         rebuild,
         setMaxHeight
