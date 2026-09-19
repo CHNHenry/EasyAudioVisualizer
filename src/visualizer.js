@@ -28,14 +28,39 @@ const diag = {
 };
 
 function flushDiag() {
+    const s = JSON.stringify(diag, null, 2);
+    // 1) 同步 native API（最可靠）
     try {
-        diag.time = new Date().toISOString();
-        betterncm.app.getDataPath().then(p => {
-            betterncm.fs.writeFileText(p + '/eav-debug.json', JSON.stringify(diag, null, 2));
-        }).catch(e => diag.errors.push('getDataPath: ' + e));
+        if (typeof betterncm_native !== 'undefined' && betterncm_native && betterncm_native.app && betterncm_native.fs) {
+            const p = betterncm_native.app.datapath();
+            betterncm_native.fs.writeFileText(p + '\\eav-debug.json', s);
+            betterncm_native.fs.writeFileText('eav-debug.json', s);
+        }
     } catch (e) {
-        diag.errors.push('flush: ' + e);
+        diag.errors.push('native flush: ' + e);
     }
+    // 2) HTTP API 兜底
+    try {
+        if (typeof betterncm !== 'undefined' && betterncm && betterncm.fs) {
+            betterncm.fs.writeFileText('eav-debug.json', s).catch(() => {});
+            betterncm.app.getDataPath().then(p => {
+                return betterncm.fs.writeFileText(p + '/eav-debug.json', s);
+            }).catch(() => {});
+        }
+    } catch (e) {
+        diag.errors.push('http flush: ' + e);
+    }
+    // 3) 窗口标题面包屑（零依赖的生存信号）
+    try {
+        const phase = diag.source || 'waiting';
+        const t = '[EAV ' + phase + (diag.anchor ? ':anchor' : ':noanchor') + ' f' + diag.frames + ']';
+        if (!document.title.includes('[EAV') && !window.__eavOrigTitle) {
+            window.__eavOrigTitle = document.title;
+        }
+        if (document.title !== t + ' ' + (window.__eavOrigTitle || '')) {
+            document.title = t + ' ' + (window.__eavOrigTitle || '');
+        }
+    } catch (e) { /* ignore */ }
 }
 
 function scanMediaElements() {
@@ -90,7 +115,7 @@ export function createVisualizer(cfg) {
         maxHeight: parseFloat(cfg.maxHeight) || 120
     };
 
-    // ---------- 叠加画布 ----------
+    // ---------- 叠加画布（body 就绪后创建，避免顶层碰 DOM 被秒杀） ----------
     const wrap = document.createElement('div');
     wrap.className = 'eav-visualizer';
     Object.assign(wrap.style, {
@@ -104,7 +129,19 @@ export function createVisualizer(cfg) {
     canvas.style.width = '100%';
     canvas.style.height = '100%';
     wrap.appendChild(canvas);
-    document.body.appendChild(wrap);
+
+    function attachWhenBody() {
+        if (document.body) {
+            document.body.appendChild(wrap);
+            return;
+        }
+        const iv = setInterval(() => {
+            if (document.body) {
+                clearInterval(iv);
+                document.body.appendChild(wrap);
+            }
+        }, 50);
+    }
 
     function syncSize() {
         const dpr = window.devicePixelRatio || 1;
@@ -344,6 +381,15 @@ export function createVisualizer(cfg) {
             wrap.style.bottom = Math.max(0, window.innerHeight - live.top + 2) + 'px';
         }
 
+        // 无数据源时画一条基线，证明「画布与定位在工作，只是没数据」
+        if (!state.dataSource) {
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
+            ctx.fillRect(0, canvas.height - 3, canvas.width, 3);
+            return;
+        }
+
         try {
             if (state.dataSource === 'lfp') {
                 const data = state.lfp.getFFTData();
@@ -382,8 +428,9 @@ export function createVisualizer(cfg) {
 
     return {
         start() {
+            attachWhenBody();
             initData();
-            // 画布随时待命：找到锚点就显示（哪怕还没有数据源，先空着）
+            // 画布随时待命：找到锚点就显示（哪怕还没有数据源，先画基线示意）
             setTimeout(syncPosition, 1000);
         },
         rebuild,
