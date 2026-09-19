@@ -1,26 +1,76 @@
-// 可视化：接管 NCM 的 audio 元素，在播放页进度条上方叠加频谱画布
+// 可视化：数据源（LibFrontendPlay 优先 / audio 元素兜底）+ 播放页进度条上方频谱叠加
 import { SoundProcessor } from './processor.js';
 import { MultiResolutionFFT } from './multi-fft.js';
 
 const AC = window.AudioContext || window.webkitAudioContext;
-
 const TAG = '[EasyAudioVisualizer]';
 
-// getByteFrequencyData 把 [minDecibels, maxDecibels]（默认 [-100, -30]）映射到 [0, 255]
-const BYTES_PER_DB = 255 / 70;
+function delay(ms) {
+    return new Promise(r => setTimeout(r, ms));
+}
 
-function waitForAudio() {
+function detectLFP() {
+    return typeof loadedPlugins !== 'undefined'
+        && loadedPlugins
+        && loadedPlugins.LibFrontendPlay
+        && typeof loadedPlugins.LibFrontendPlay.getFFTData === 'function';
+}
+
+// 诊断信息落盘，便于远程排查（写入 BetterNCM 数据目录 eav-debug.json）
+const diag = {
+    time: '',
+    lfpDetected: false,
+    mediaElements: [],
+    source: null,   // 'lfp' | 'element' | 'none' | null(仍在等待)
+    anchor: null,
+    frames: 0,
+    errors: []
+};
+
+function flushDiag() {
+    try {
+        diag.time = new Date().toISOString();
+        betterncm.app.getDataPath().then(p => {
+            betterncm.fs.writeFileText(p + '/eav-debug.json', JSON.stringify(diag, null, 2));
+        }).catch(e => diag.errors.push('getDataPath: ' + e));
+    } catch (e) {
+        diag.errors.push('flush: ' + e);
+    }
+}
+
+function scanMediaElements() {
+    try {
+        diag.mediaElements = Array.from(document.querySelectorAll('audio,video')).map(el => ({
+            tag: el.tagName,
+            id: el.id || undefined,
+            cls: (el.className && el.className.baseVal === undefined ? String(el.className) : '').slice(0, 60) || undefined,
+            src: String(el.currentSrc || el.src || '').slice(0, 100) || undefined
+        }));
+    } catch (e) {
+        diag.errors.push('scan: ' + e);
+    }
+}
+
+function waitForMedia(timeoutMs) {
     return new Promise(resolve => {
-        const found = document.querySelector('audio');
+        const found = document.querySelector('audio,video');
         if (found) return resolve(found);
         const obs = new MutationObserver(() => {
-            const el = document.querySelector('audio');
+            const el = document.querySelector('audio,video');
             if (el) {
                 obs.disconnect();
                 resolve(el);
             }
         });
         obs.observe(document.documentElement, { childList: true, subtree: true });
+        if (timeoutMs) {
+            setTimeout(() => {
+                obs.disconnect();
+                scanMediaElements();
+                flushDiag();
+                resolve(null);
+            }, timeoutMs);
+        }
     });
 }
 
@@ -35,6 +85,8 @@ export function createVisualizer(cfg) {
         multiProcessor: null,
         raw: null,
         anchor: null,
+        dataSource: null, // 'lfp' | 'element'
+        lfp: null,
         maxHeight: parseFloat(cfg.maxHeight) || 120
     };
 
@@ -62,8 +114,8 @@ export function createVisualizer(cfg) {
 
     // ---------- 锚点定位：播放页进度条上方，左右无留白 ----------
     function findAnchor() {
-        // 播放页（全屏正在播放页）
-        const playPage = document.querySelector('.g-playpage, [class*="playpage" i], #playpage');
+        // 播放页（全屏正在播放页）；.g-singlec-ct 为 SAV 验证过的播放页容器
+        const playPage = document.querySelector('.g-singlec-ct, .g-playpage, [class*="playpage" i], #playpage');
         if (playPage) {
             const rect = playPage.getBoundingClientRect();
             if (rect.width > 0 && rect.height > 0) {
@@ -122,7 +174,18 @@ export function createVisualizer(cfg) {
     observer.observe(document.documentElement, { childList: true, subtree: true });
     window.addEventListener('resize', syncPosition);
 
-    // ---------- 音频接入 ----------
+    // ---------- 数据源 A：LibFrontendPlay ----------
+    function useLFP() {
+        state.dataSource = 'lfp';
+        state.lfp = loadedPlugins.LibFrontendPlay;
+        diag.source = 'lfp';
+        diag.lfpDetected = true;
+        flushDiag();
+        console.info(TAG, 'data source = LibFrontendPlay.getFFTData()');
+        requestAnimationFrame(frame);
+    }
+
+    // ---------- 数据源 B：接管 audio 元素 ----------
     function ensureTierAnalysers() {
         if (state.tierAnalysers) return;
         state.tierAnalysers = [8192, 2048, 512].map(size => {
@@ -134,8 +197,7 @@ export function createVisualizer(cfg) {
         state.tierBuffers = state.tierAnalysers.map(an => new Uint8Array(an.frequencyBinCount));
     }
 
-    async function hookAudio() {
-        const audio = await waitForAudio();
+    function hookElement(audio) {
         state.ac = new AC();
         // MediaElementSource 接管 audio 输出，必须连回 destination 才有声音
         state.source = state.ac.createMediaElementSource(audio);
@@ -145,17 +207,60 @@ export function createVisualizer(cfg) {
         audio.addEventListener('play', () => {
             state.ac.resume();
         });
-        console.info(TAG, 'audio hooked, sampleRate =', state.ac.sampleRate);
+        state.dataSource = 'element';
+        diag.source = 'element';
+        flushDiag();
+        console.info(TAG, 'data source = audio element, sampleRate =', state.ac.sampleRate);
         rebuild();
         requestAnimationFrame(frame);
     }
 
+    // ---------- 数据源协商 ----------
+    async function initData() {
+        flushDiag();
+        // 1) LFP（插件加载顺序不定，轮询等待）
+        const t0 = Date.now();
+        while (Date.now() - t0 < 20000) {
+            if (detectLFP()) {
+                useLFP();
+                return;
+            }
+            await delay(500);
+            scanMediaElements();
+            if ((Date.now() - t0) % 8000 < 500) flushDiag();
+        }
+        diag.lfpDetected = detectLFP();
+        // 2) 页面媒体元素
+        const el = await waitForMedia(15000);
+        if (el) {
+            scanMediaElements();
+            try {
+                hookElement(el);
+            } catch (e) {
+                diag.errors.push('hook: ' + e);
+                flushDiag();
+            }
+            return;
+        }
+        // 3) 无数据源
+        diag.source = diag.source || 'none';
+        flushDiag();
+        console.warn(TAG, 'no data source: neither LibFrontendPlay nor <audio>/<video> found', diag);
+        // 60s 内持续再探测（页面可能延迟创建）
+        setTimeout(function retry() {
+            if (detectLFP()) return useLFP();
+            const el2 = document.querySelector('audio,video');
+            if (el2) {
+                try { hookElement(el2); } catch (e) { diag.errors.push('hook2: ' + e); }
+                return;
+            }
+            flushDiag();
+            setTimeout(retry, 10000);
+        }, 10000);
+    }
+
     // ---------- 处理器重建（参数变化时调用） ----------
-    function rebuild() {
-        if (!state.ac) return;
-        const sampleRate = cfg.sampleRate
-            ? parseFloat(cfg.sampleRate)
-            : state.ac.sampleRate;
+    function buildProcessor(sampleRate, fftSize) {
         const params = {
             sampleRate,
             startFrequency: parseFloat(cfg.startFrequency) || 0,
@@ -164,25 +269,38 @@ export function createVisualizer(cfg) {
             tWeight: cfg.tWeight === '1',
             aWeight: cfg.aWeight === '1'
         };
-        try {
-            if (cfg.multiFFT === '1') {
-                ensureTierAnalysers();
-                state.processor = null;
-                state.multiProcessor = new MultiResolutionFFT(params);
-            } else {
-                state.multiProcessor = null;
-                state.analyser.fftSize = parseInt(cfg.fftSize, 10) || 1024;
-                state.processor = new SoundProcessor({
-                    ...params,
-                    fftSize: parseInt(cfg.fftSize, 10) || 1024,
-                    filterParams: cfg.filterOn === '1' ? {
-                        sigma: parseFloat(cfg.sigma) || 1,
-                        radius: Math.max(0, Math.round(parseFloat(cfg.radius) || 0))
-                    } : undefined
-                });
+        if (cfg.multiFFT === '1' && state.dataSource === 'element') {
+            ensureTierAnalysers();
+            state.processor = null;
+            state.multiProcessor = new MultiResolutionFFT(params);
+        } else {
+            state.multiProcessor = null;
+            if (state.analyser) {
+                state.analyser.fftSize = fftSize;
             }
+            state.processor = new SoundProcessor({
+                ...params,
+                fftSize,
+                filterParams: cfg.filterOn === '1' ? {
+                    sigma: parseFloat(cfg.sigma) || 1,
+                    radius: Math.max(0, Math.round(parseFloat(cfg.radius) || 0))
+                } : undefined
+            });
+        }
+    }
+
+    function rebuild() {
+        if (state.dataSource === 'lfp') return; // lfp 模式按实际数据长度懒构建
+        if (!state.ac) return;
+        const fftSize = parseInt(cfg.fftSize, 10) || 1024;
+        const sampleRate = cfg.sampleRate
+            ? parseFloat(cfg.sampleRate)
+            : state.ac.sampleRate;
+        try {
+            buildProcessor(sampleRate, fftSize);
         } catch (e) {
             console.error(TAG, 'rebuild failed', e);
+            diag.errors.push('rebuild: ' + e);
             state.processor = null;
             state.multiProcessor = null;
         }
@@ -215,40 +333,58 @@ export function createVisualizer(cfg) {
 
     function frame() {
         requestAnimationFrame(frame);
-        if (!state.analyser || wrap.style.display === 'none') return;
+        if (wrap.style.display === 'none') return;
 
         // 锚点位置每帧跟随（页面切换时进度条会移动）
-        const rect = state.anchor;
-        if (rect) {
-            const live = findAnchor();
-            if (live) {
-                wrap.style.left = live.left + 'px';
-                wrap.style.width = live.width + 'px';
-                wrap.style.bottom = Math.max(0, window.innerHeight - live.top + 2) + 'px';
-            }
+        const live = findAnchor();
+        if (live) {
+            state.anchor = live;
+            wrap.style.left = live.left + 'px';
+            wrap.style.width = live.width + 'px';
+            wrap.style.bottom = Math.max(0, window.innerHeight - live.top + 2) + 'px';
         }
 
-        if (state.multiProcessor) {
-            for (let t = 0; t < state.tierAnalysers.length; t++) {
-                state.tierAnalysers[t].getByteFrequencyData(state.tierBuffers[t]);
+        try {
+            if (state.dataSource === 'lfp') {
+                const data = state.lfp.getFFTData();
+                if (data && data.length) {
+                    // LFP 的 analyser 未设置 fftSize（默认 2048），按实际数据长度懒构建
+                    if (!state.processor && !state.multiProcessor) {
+                        const sr = (state.lfp.currentAudioContext && state.lfp.currentAudioContext.sampleRate)
+                            || parseFloat(cfg.sampleRate) || 48000;
+                        buildProcessor(sr, data.length * 2);
+                    }
+                    drawBars(state.processor.process(data));
+                    diag.frames++;
+                }
+            } else if (state.dataSource === 'element') {
+                if (state.multiProcessor) {
+                    for (let t = 0; t < state.tierAnalysers.length; t++) {
+                        state.tierAnalysers[t].getByteFrequencyData(state.tierBuffers[t]);
+                    }
+                    drawBars(state.multiProcessor.process(state.tierBuffers));
+                    diag.frames++;
+                } else if (state.processor) {
+                    const len = state.analyser.frequencyBinCount;
+                    if (!state.raw || state.raw.length !== len) {
+                        state.raw = new Uint8Array(len);
+                    }
+                    state.analyser.getByteFrequencyData(state.raw);
+                    drawBars(state.processor.process(state.raw));
+                    diag.frames++;
+                }
             }
-            drawBars(state.multiProcessor.process(state.tierBuffers));
-        } else if (state.processor) {
-            const len = state.analyser.frequencyBinCount;
-            if (!state.raw || state.raw.length !== len) {
-                state.raw = new Uint8Array(len);
-            }
-            state.analyser.getByteFrequencyData(state.raw);
-            drawBars(state.processor.process(state.raw));
+        } catch (e) {
+            diag.errors.push('frame: ' + e);
+            if (diag.errors.length < 20) flushDiag();
         }
     }
 
-    // BYTES_PER_DB 保留给未来对外 API 使用（多支路校准已内置在 multi-fft 中）
-    void BYTES_PER_DB;
-
     return {
         start() {
-            hookAudio().catch(e => console.error(TAG, 'init failed', e));
+            initData();
+            // 画布随时待命：找到锚点就显示（哪怕还没有数据源，先空着）
+            setTimeout(syncPosition, 1000);
         },
         rebuild,
         setMaxHeight
