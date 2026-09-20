@@ -43,7 +43,7 @@ function probeDom() {
         });
         const ids = Array.from(document.querySelectorAll('[id]')).slice(0, 60).map(el => el.id);
         const barish = Array.from(document.querySelectorAll(
-            '[class*="prg" i],[class*="progress" i],[class*="slider" i],[role="slider"],[class*="player" i],[class*="btm" i],[class*="bar" i]'
+            '[class*="prg" i],[class*="progress" i],[class*="slider" i],[role="slider"],[class*="DefaultBar" i],[class*="VinylPage" i]'
         )).slice(0, 60).map(pick);
         const bodyChildren = Array.from(document.body ? document.body.children : []).slice(0, 20).map(pick);
         diag.domProbe = { ids, barish, bodyChildren };
@@ -205,16 +205,23 @@ export function createVisualizer(cfg) {
 
     // ---------- 锚点定位：播放页进度条上方，左右无留白 ----------
     // 返回 { rect, mode }；mode 记录用了哪条策略（进诊断）
+    // NCM 3.x 类名为 CSS-modules（前缀稳定、hash 后缀）：StyledSliderContainer_xxx 等
     function findAnchor() {
         const vw = window.innerWidth;
         const vh = window.innerHeight;
 
-        // 1) 播放页（全屏正在播放页）
+        // 1) 播放页进度条（NCM3 黑胶/全屏播放页）
+        const playSlider = document.querySelector('[class*="slider-vinyl"]');
+        if (playSlider) {
+            const rect = playSlider.getBoundingClientRect();
+            if (rect.width > vw * 0.3 && rect.height > 2 && rect.top > vh * 0.5) {
+                return { rect, mode: 'playpage-slider-vinyl' };
+            }
+        }
         const playPage = document.querySelector('.g-singlec-ct, .g-playpage, [class*="playpage" i], #playpage');
         if (playPage) {
             const rect = playPage.getBoundingClientRect();
             if (rect.width > 0 && rect.height > 0) {
-                // 在播放页里找进度条：横向够宽、位于页面下部、矮条（排除容器）
                 const candidates = Array.from(playPage.querySelectorAll('[class*="prg"], [class*="progress"], [class*="bar"], [role="slider"]'));
                 const bars = candidates
                     .map(el => ({ el, rect: el.getBoundingClientRect() }))
@@ -226,22 +233,12 @@ export function createVisualizer(cfg) {
                     bars.sort((a, b) => a.rect.height - b.rect.height);
                     return { rect: bars[0].rect, mode: 'playpage-bar' };
                 }
-                // 兜底：贴播放页底部
                 return { rect: { left: rect.left, top: rect.bottom - 40, width: rect.width }, mode: 'playpage-bottom' };
             }
         }
 
-        // 2) 全局搜疑似进度条/滑块（NCM3 类名未知，按几何特征筛）
-        const global = Array.from(document.querySelectorAll('[class*="prg" i],[class*="progress" i],[role="slider"],[class*="slider" i]'))
-            .map(el => el.getBoundingClientRect())
-            .filter(r => r.width > vw * 0.3 && r.height > 2 && r.height < 120 && r.top > vh * 0.5);
-        if (global.length) {
-            global.sort((a, b) => a.height - b.height);
-            return { rect: global[0], mode: 'global-slider' };
-        }
-
-        // 3) 兜底：底部播放栏（NCM2 类名）
-        const bottomBar = document.querySelector('#main-player') || document.querySelector('.g-btmbar');
+        // 2) 底部播放栏（NCM3）：频谱贴着播放栏上沿
+        const bottomBar = document.querySelector('[class*="DefaultBarWrapper_"], #main-player, .g-btmbar');
         if (bottomBar) {
             const rect = bottomBar.getBoundingClientRect();
             if (rect.height > 0) {
@@ -249,7 +246,16 @@ export function createVisualizer(cfg) {
             }
         }
 
-        // 4) 最终兜底：视口底部 60px（保证可见，之后靠 domProbe 精调）
+        // 3) 全局搜疑似进度条/滑块（几何特征筛）
+        const global = Array.from(document.querySelectorAll('[class*="slider-default"],[class*="prg" i],[class*="progress" i],[role="slider"],[class*="slider" i]'))
+            .map(el => el.getBoundingClientRect())
+            .filter(r => r.width > vw * 0.3 && r.height > 2 && r.height < 120 && r.top > vh * 0.5);
+        if (global.length) {
+            global.sort((a, b) => a.height - b.height);
+            return { rect: global[0], mode: 'global-slider' };
+        }
+
+        // 4) 最终兜底：视口底部 60px（保证可见）
         if (vh > 200) {
             return { rect: { left: 0, top: vh - 60, width: vw }, mode: 'viewport-fallback' };
         }
@@ -268,25 +274,22 @@ export function createVisualizer(cfg) {
         state.anchor = rect;
         diag.anchor = { t: Math.round(rect.top), h: Math.round(rect.height), w: Math.round(rect.width) };
         diag.anchorMode = found.mode;
-        wrap.style.display = 'block';
-        wrap.style.left = rect.left + 'px';
-        wrap.style.width = rect.width + 'px';
-        wrap.style.top = 'auto';
-        wrap.style.height = state.maxHeight + 'px';
-        wrap.style.bottom = Math.max(0, window.innerHeight - rect.top + 2) + 'px';
-        syncSize();
+        // 样式仅在变化时写入，避免无谓的样式重算
+        const left = Math.round(rect.left);
+        const width = Math.round(rect.width);
+        const bottom = Math.max(0, Math.round(window.innerHeight - rect.top + 2));
+        if (wrap.style.display !== 'block') {
+            wrap.style.display = 'block';
+            wrap.style.height = state.maxHeight + 'px';
+            syncSize();
+        }
+        if (wrap._left !== left) { wrap.style.left = left + 'px'; wrap._left = left; }
+        if (wrap._width !== width) { wrap.style.width = width + 'px'; wrap._width = width; }
+        if (wrap._bottom !== bottom) { wrap.style.bottom = bottom + 'px'; wrap._bottom = bottom; }
     }
 
-    // 进度条/页面结构变化时重新定位（节流）
-    let repositionTimer = null;
-    const observer = new MutationObserver(() => {
-        if (repositionTimer) return;
-        repositionTimer = setTimeout(() => {
-            repositionTimer = null;
-            syncPosition();
-        }, 400);
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
+    // 锚点跟踪用低频定时器（500ms）；不用 MutationObserver——
+    // NCM3 的 React 应用每帧都在改 DOM，子树观察器会造成回调风暴
     window.addEventListener('resize', syncPosition);
 
     // ---------- 数据源 A：LibFrontendPlay ----------
@@ -448,28 +451,15 @@ export function createVisualizer(cfg) {
 
     function frame() {
         requestAnimationFrame(frame);
-        if (wrap.style.display === 'none') {
-            // 定位失败也不会永远卡死：每秒重试定位
-            setTimeout(syncPosition, 1000);
-            return;
-        }
+        if (wrap.style.display === 'none' || !state.anchor) return;
 
-        // 锚点位置每帧跟随（页面切换时进度条会移动）
-        const found = findAnchor();
-        if (found) {
-            const live = found.rect;
-            state.anchor = live;
-            wrap.style.left = live.left + 'px';
-            wrap.style.width = live.width + 'px';
-            wrap.style.bottom = Math.max(0, window.innerHeight - live.top + 2) + 'px';
-        }
-
+        // 纯绘制：定位/样式更新统一由 syncPosition 定时器负责，帧循环不做任何 DOM 查询
         // 无数据源时画一条基线，证明「画布与定位在工作，只是没数据」
         if (!state.dataSource) {
-            const ctx = canvas.getContext('2d');
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
-            ctx.fillRect(0, canvas.height - 3, canvas.width, 3);
+            const ctx0 = canvas.getContext('2d');
+            ctx0.clearRect(0, 0, canvas.width, canvas.height);
+            ctx0.fillStyle = 'rgba(255, 255, 255, 0.22)';
+            ctx0.fillRect(0, canvas.height - 3, canvas.width, 3);
             return;
         }
 
@@ -509,17 +499,44 @@ export function createVisualizer(cfg) {
         }
     }
 
+    // 运行时状态（供设置页「运行时信息」展示）
+    function getStats() {
+        const p = state.processor;
+        const m = state.multiProcessor;
+        const stats = {
+            source: state.dataSource,
+            anchorMode: diag.anchorMode,
+            sampleRate: p ? p.sampleRate : (m ? m.sampleRate : null),
+            fftSize: p ? p.fftSize : null,
+            bandwidth: p ? (p.sampleRate / p.fftSize) : null,
+            outBandsQty: p ? p.outBandsQty : (m ? m.outBandsQty : null),
+            filter: cfg.filterOn === '1'
+                ? 'sigma=' + cfg.sigma + ', radius=' + cfg.radius
+                : '关闭',
+            multiFFT: !!m,
+            maxHeight: state.maxHeight,
+            frames: diag.frames
+        };
+        if (m) {
+            const ts = m.tierStats();
+            stats.tiers = m.tiers.map((s, i) => s + '×' + ts.counts[i] + '带');
+            stats.crossings = ts.crossings.map(f => Math.round(f) + 'Hz');
+        }
+        return stats;
+    }
+
     return {
         start() {
             attachWhenBody();
             initData();
             // 画布随时待命：找到锚点就显示（没有数据源时画基线示意）
             setTimeout(syncPosition, 1000);
-            // 定位失败时的持续重试 + 周期性诊断落盘
-            setInterval(syncPosition, 1500);
-            setInterval(flushDiag, 10000);
+            // 锚点低频跟踪 + 诊断落盘（帧循环零 DOM 查询，保证不卡）
+            setInterval(syncPosition, 500);
+            setInterval(flushDiag, 30000);
         },
         rebuild,
-        setMaxHeight
+        setMaxHeight,
+        getStats
     };
 }
