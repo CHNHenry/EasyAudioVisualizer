@@ -1,4 +1,5 @@
 // 可视化：数据源（LibFrontendPlay 优先 / audio 元素兜底）+ 播放页进度条上方频谱叠加
+// 无任何调试 I/O：帧循环零 DOM 查询，定位走 500ms 低频心跳
 import { SoundProcessor } from './processor.js';
 import { MultiResolutionFFT } from './multi-fft.js';
 
@@ -16,121 +17,7 @@ function detectLFP() {
         && typeof loadedPlugins.LibFrontendPlay.getFFTData === 'function';
 }
 
-// 诊断信息落盘，便于远程排查（写入 BetterNCM 数据目录 eav-debug.json）
-const diag = {
-    time: '',
-    href: '',
-    lfpDetected: false,
-    lfpProbe: null,
-    mediaElements: [],
-    source: null,   // 'lfp' | 'element' | 'none' | null(仍在等待)
-    anchor: null,
-    anchorMode: null,
-    frames: 0,
-    viewport: null,
-    domProbe: null,
-    errors: []
-};
-
-// DOM 结构探针：收集 id、疑似进度条/播放条元素，用于远程适配选择器
-function probeDom() {
-    try {
-        const pick = el => ({
-            tag: el.tagName.toLowerCase(),
-            id: el.id || undefined,
-            cls: String(el.className && el.className.baseVal === undefined ? el.className : '').slice(0, 80) || undefined,
-            rect: (r => ({ t: Math.round(r.top), h: Math.round(r.height), w: Math.round(r.width) }))(el.getBoundingClientRect())
-        });
-        const ids = Array.from(document.querySelectorAll('[id]')).slice(0, 60).map(el => el.id);
-        const barish = Array.from(document.querySelectorAll(
-            '[class*="prg" i],[class*="progress" i],[class*="slider" i],[role="slider"],[class*="DefaultBar" i],[class*="VinylPage" i]'
-        )).slice(0, 60).map(pick);
-        const bodyChildren = Array.from(document.body ? document.body.children : []).slice(0, 20).map(pick);
-        diag.domProbe = { ids, barish, bodyChildren };
-        diag.href = String(location.href).slice(0, 120);
-        diag.viewport = { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio || 1 };
-    } catch (e) {
-        diag.errors.push('probe: ' + e);
-    }
-}
-
-// 探测 LFP 音频管线是否真的激活（hijack 在 NCM3 上是否生效）
-function probeLFP() {
-    try {
-        if (typeof loadedPlugins === 'undefined' || !loadedPlugins.LibFrontendPlay) return;
-        const L = loadedPlugins.LibFrontendPlay;
-        diag.lfpProbe = {
-            hasCtx: !!L.currentAudioContext,
-            hasPlayer: !!L.currentAudioPlayer,
-            playState: L.info ? L.info.playState : undefined,
-            url: L.info ? String(L.info.url || '').slice(0, 80) : undefined,
-            fftLen: (() => {
-                try {
-                    const d = L.getFFTData();
-                    return d ? d.length : -1;
-                } catch (e) {
-                    return 'ERR: ' + e;
-                }
-            })()
-        };
-    } catch (e) {
-        diag.errors.push('lfpProbe: ' + e);
-    }
-}
-
-function flushDiag() {
-    diag.time = new Date().toISOString();
-    probeDom();
-    probeLFP();
-    const s = JSON.stringify(diag, null, 2);
-    // 1) 同步 native API（最可靠）
-    try {
-        if (typeof betterncm_native !== 'undefined' && betterncm_native && betterncm_native.app && betterncm_native.fs) {
-            const p = betterncm_native.app.datapath();
-            betterncm_native.fs.writeFileText(p + '\\eav-debug.json', s);
-            betterncm_native.fs.writeFileText('eav-debug.json', s);
-        }
-    } catch (e) {
-        diag.errors.push('native flush: ' + e);
-    }
-    // 2) HTTP API 兜底
-    try {
-        if (typeof betterncm !== 'undefined' && betterncm && betterncm.fs) {
-            betterncm.fs.writeFileText('eav-debug.json', s).catch(() => {});
-            betterncm.app.getDataPath().then(p => {
-                return betterncm.fs.writeFileText(p + '/eav-debug.json', s);
-            }).catch(() => {});
-        }
-    } catch (e) {
-        diag.errors.push('http flush: ' + e);
-    }
-    // 3) 窗口标题面包屑（零依赖的生存信号）
-    try {
-        const phase = diag.source || 'waiting';
-        const t = '[EAV ' + phase + (diag.anchor ? ':anchor' : ':noanchor') + ' f' + diag.frames + ']';
-        if (!document.title.includes('[EAV') && !window.__eavOrigTitle) {
-            window.__eavOrigTitle = document.title;
-        }
-        if (document.title !== t + ' ' + (window.__eavOrigTitle || '')) {
-            document.title = t + ' ' + (window.__eavOrigTitle || '');
-        }
-    } catch (e) { /* ignore */ }
-}
-
-function scanMediaElements() {
-    try {
-        diag.mediaElements = Array.from(document.querySelectorAll('audio,video')).map(el => ({
-            tag: el.tagName,
-            id: el.id || undefined,
-            cls: (el.className && el.className.baseVal === undefined ? String(el.className) : '').slice(0, 60) || undefined,
-            src: String(el.currentSrc || el.src || '').slice(0, 100) || undefined
-        }));
-    } catch (e) {
-        diag.errors.push('scan: ' + e);
-    }
-}
-
-function waitForMedia(timeoutMs) {
+function waitForMedia() {
     return new Promise(resolve => {
         const found = document.querySelector('audio,video');
         if (found) return resolve(found);
@@ -142,14 +29,6 @@ function waitForMedia(timeoutMs) {
             }
         });
         obs.observe(document.documentElement, { childList: true, subtree: true });
-        if (timeoutMs) {
-            setTimeout(() => {
-                obs.disconnect();
-                scanMediaElements();
-                flushDiag();
-                resolve(null);
-            }, timeoutMs);
-        }
     });
 }
 
@@ -164,12 +43,15 @@ export function createVisualizer(cfg) {
         multiProcessor: null,
         raw: null,
         anchor: null,
+        anchorMode: null,
         dataSource: null, // 'lfp' | 'element'
         lfp: null,
-        maxHeight: parseFloat(cfg.maxHeight) || 120
+        frames: 0,
+        maxHeight: parseFloat(cfg.maxHeight) || 120,
+        lastSum: -1 // 停顿时跳过重绘
     };
 
-    // ---------- 叠加画布（body 就绪后创建，避免顶层碰 DOM 被秒杀） ----------
+    // ---------- 叠加画布 ----------
     const wrap = document.createElement('div');
     wrap.className = 'eav-visualizer';
     Object.assign(wrap.style, {
@@ -199,13 +81,16 @@ export function createVisualizer(cfg) {
 
     function syncSize() {
         const dpr = window.devicePixelRatio || 1;
-        canvas.width = Math.max(1, wrap.clientWidth * dpr);
-        canvas.height = Math.max(1, state.maxHeight * dpr);
+        const w = Math.max(1, wrap.clientWidth * dpr);
+        const h = Math.max(1, state.maxHeight * dpr);
+        if (canvas.width !== w || canvas.height !== h) {
+            canvas.width = w;
+            canvas.height = h;
+        }
     }
 
     // ---------- 锚点定位：播放页进度条上方，左右无留白 ----------
-    // 返回 { rect, mode }；mode 记录用了哪条策略（进诊断）
-    // NCM 3.x 类名为 CSS-modules（前缀稳定、hash 后缀）：StyledSliderContainer_xxx 等
+    // 返回 { rect, mode }；NCM 3.x 类名为 CSS-modules（前缀稳定、hash 后缀）
     function findAnchor() {
         const vw = window.innerWidth;
         const vh = window.innerHeight;
@@ -265,15 +150,14 @@ export function createVisualizer(cfg) {
     function syncPosition() {
         const found = findAnchor();
         if (!found) {
-            wrap.style.display = 'none';
-            diag.anchor = null;
-            diag.anchorMode = null;
+            if (wrap.style.display !== 'none') wrap.style.display = 'none';
+            state.anchor = null;
+            state.anchorMode = null;
             return;
         }
         const rect = found.rect;
         state.anchor = rect;
-        diag.anchor = { t: Math.round(rect.top), h: Math.round(rect.height), w: Math.round(rect.width) };
-        diag.anchorMode = found.mode;
+        state.anchorMode = found.mode;
         // 样式仅在变化时写入，避免无谓的样式重算
         const left = Math.round(rect.left);
         const width = Math.round(rect.width);
@@ -288,17 +172,10 @@ export function createVisualizer(cfg) {
         if (wrap._bottom !== bottom) { wrap.style.bottom = bottom + 'px'; wrap._bottom = bottom; }
     }
 
-    // 锚点跟踪用低频定时器（500ms）；不用 MutationObserver——
-    // NCM3 的 React 应用每帧都在改 DOM，子树观察器会造成回调风暴
-    window.addEventListener('resize', syncPosition);
-
     // ---------- 数据源 A：LibFrontendPlay ----------
     function useLFP() {
         state.dataSource = 'lfp';
         state.lfp = loadedPlugins.LibFrontendPlay;
-        diag.source = 'lfp';
-        diag.lfpDetected = true;
-        flushDiag();
         console.info(TAG, 'data source = LibFrontendPlay.getFFTData()');
     }
 
@@ -325,54 +202,28 @@ export function createVisualizer(cfg) {
             state.ac.resume();
         });
         state.dataSource = 'element';
-        diag.source = 'element';
-        flushDiag();
         console.info(TAG, 'data source = audio element, sampleRate =', state.ac.sampleRate);
         rebuild();
     }
 
     // ---------- 数据源协商 ----------
     async function initData() {
-        flushDiag();
-        // 1) LFP（插件加载顺序不定，轮询等待）
+        // 1) LFP（插件加载顺序不定，轮询等待；检测是属性访问，零开销）
         const t0 = Date.now();
         while (Date.now() - t0 < 20000) {
             if (detectLFP()) {
                 useLFP();
                 return;
             }
-            await delay(500);
-            scanMediaElements();
-            if ((Date.now() - t0) % 8000 < 500) flushDiag();
+            await delay(1000);
         }
-        diag.lfpDetected = detectLFP();
-        // 2) 页面媒体元素
-        const el = await waitForMedia(15000);
-        if (el) {
-            scanMediaElements();
-            try {
-                hookElement(el);
-            } catch (e) {
-                diag.errors.push('hook: ' + e);
-                flushDiag();
-            }
-            return;
+        // 2) 页面媒体元素（NCM2 或装了同类前端播放插件时存在）
+        const el = await waitForMedia();
+        try {
+            hookElement(el);
+        } catch (e) {
+            console.error(TAG, 'hook audio failed', e);
         }
-        // 3) 无数据源
-        diag.source = diag.source || 'none';
-        flushDiag();
-        console.warn(TAG, 'no data source: neither LibFrontendPlay nor <audio>/<video> found', diag);
-        // 60s 内持续再探测（页面可能延迟创建）
-        setTimeout(function retry() {
-            if (detectLFP()) return useLFP();
-            const el2 = document.querySelector('audio,video');
-            if (el2) {
-                try { hookElement(el2); } catch (e) { diag.errors.push('hook2: ' + e); }
-                return;
-            }
-            flushDiag();
-            setTimeout(retry, 10000);
-        }, 10000);
     }
 
     // ---------- 处理器重建（参数变化时调用） ----------
@@ -416,7 +267,6 @@ export function createVisualizer(cfg) {
             buildProcessor(sampleRate, fftSize);
         } catch (e) {
             console.error(TAG, 'rebuild failed', e);
-            diag.errors.push('rebuild: ' + e);
             state.processor = null;
             state.multiProcessor = null;
         }
@@ -424,7 +274,8 @@ export function createVisualizer(cfg) {
 
     function setMaxHeight(px) {
         state.maxHeight = Math.max(20, px || 120);
-        syncPosition();
+        wrap.style.height = state.maxHeight + 'px';
+        syncSize();
     }
 
     // ---------- 绘制 ----------
@@ -447,17 +298,20 @@ export function createVisualizer(cfg) {
         }
     }
 
+    function drawBaseline() {
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
+        ctx.fillRect(0, canvas.height - 3, canvas.width, 3);
+    }
+
     function frame() {
         requestAnimationFrame(frame);
         if (wrap.style.display === 'none' || !state.anchor) return;
 
-        // 纯绘制：定位/样式更新统一由 syncPosition 定时器负责，帧循环不做任何 DOM 查询
         // 无数据源时画一条基线，证明「画布与定位在工作，只是没数据」
         if (!state.dataSource) {
-            const ctx0 = canvas.getContext('2d');
-            ctx0.clearRect(0, 0, canvas.width, canvas.height);
-            ctx0.fillStyle = 'rgba(255, 255, 255, 0.22)';
-            ctx0.fillRect(0, canvas.height - 3, canvas.width, 3);
+            drawBaseline();
             return;
         }
 
@@ -471,8 +325,14 @@ export function createVisualizer(cfg) {
                             || parseFloat(cfg.sampleRate) || 48000;
                         buildProcessor(sr, data.length * 2);
                     }
-                    drawBars(state.processor.process(data));
-                    diag.frames++;
+                    // 停顿（全零）时跳过重绘
+                    let sum = 0;
+                    for (let i = 0; i < data.length; i += 8) sum += data[i];
+                    if (sum !== state.lastSum) {
+                        state.lastSum = sum;
+                        drawBars(state.processor.process(data));
+                        state.frames++;
+                    }
                 }
             } else if (state.dataSource === 'element') {
                 if (state.multiProcessor) {
@@ -480,7 +340,7 @@ export function createVisualizer(cfg) {
                         state.tierAnalysers[t].getByteFrequencyData(state.tierBuffers[t]);
                     }
                     drawBars(state.multiProcessor.process(state.tierBuffers));
-                    diag.frames++;
+                    state.frames++;
                 } else if (state.processor) {
                     const len = state.analyser.frequencyBinCount;
                     if (!state.raw || state.raw.length !== len) {
@@ -488,12 +348,11 @@ export function createVisualizer(cfg) {
                     }
                     state.analyser.getByteFrequencyData(state.raw);
                     drawBars(state.processor.process(state.raw));
-                    diag.frames++;
+                    state.frames++;
                 }
             }
         } catch (e) {
-            diag.errors.push('frame: ' + e);
-            if (diag.errors.length < 20) flushDiag();
+            console.error(TAG, 'frame error', e);
         }
     }
 
@@ -503,7 +362,7 @@ export function createVisualizer(cfg) {
         const m = state.multiProcessor;
         const stats = {
             source: state.dataSource,
-            anchorMode: diag.anchorMode,
+            anchorMode: state.anchorMode,
             sampleRate: p ? p.sampleRate : (m ? m.sampleRate : null),
             fftSize: p ? p.fftSize : null,
             bandwidth: p ? (p.sampleRate / p.fftSize) : null,
@@ -513,7 +372,7 @@ export function createVisualizer(cfg) {
                 : '关闭',
             multiFFT: !!m,
             maxHeight: state.maxHeight,
-            frames: diag.frames
+            frames: state.frames
         };
         if (m) {
             const ts = m.tierStats();
@@ -529,11 +388,9 @@ export function createVisualizer(cfg) {
             // 绘制循环无条件启动：无数据源时画基线，让「定位在工作、只差数据」可见
             requestAnimationFrame(frame);
             initData();
-            // 画布随时待命：找到锚点就显示（没有数据源时画基线示意）
+            // 锚点低频跟踪（帧循环零 DOM 查询，保证不卡）
             setTimeout(syncPosition, 1000);
-            // 锚点低频跟踪 + 诊断落盘（帧循环零 DOM 查询，保证不卡）
             setInterval(syncPosition, 500);
-            setInterval(flushDiag, 30000);
         },
         rebuild,
         setMaxHeight,
