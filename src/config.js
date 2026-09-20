@@ -5,15 +5,15 @@ const PREFIX = 'easyav.';
 export const DEFAULTS = {
     sampleRate: '',      // '' = 自动取 AudioContext 采样率
     fftSize: '1024',
-    startFrequency: '150',
-    endFrequency: '4500',
-    outBandsQty: '81',
-    tWeight: '1',
-    aWeight: '1',
-    filterOn: '1',
+    startFrequency: '50',
+    endFrequency: '9000',
+    outBandsQty: '300',
+    tWeight: '0',
+    aWeight: '0',
+    filterOn: '0',
     sigma: '1',
     radius: '2',
-    multiFFT: '0',       // 多分辨率分体 8192/2048/512（仅 audio 元素模式生效）
+    multiFFT: '1',       // 多分辨率分体 8192/2048/512（仅 audio 元素模式生效）
     maxHeight: '120'     // 柱形条群最大高度 px
 };
 

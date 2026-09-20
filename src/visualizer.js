@@ -300,7 +300,6 @@ export function createVisualizer(cfg) {
         diag.lfpDetected = true;
         flushDiag();
         console.info(TAG, 'data source = LibFrontendPlay.getFFTData()');
-        requestAnimationFrame(frame);
     }
 
     // ---------- 数据源 B：接管 audio 元素 ----------
@@ -330,7 +329,6 @@ export function createVisualizer(cfg) {
         flushDiag();
         console.info(TAG, 'data source = audio element, sampleRate =', state.ac.sampleRate);
         rebuild();
-        requestAnimationFrame(frame);
     }
 
     // ---------- 数据源协商 ----------
@@ -528,6 +526,8 @@ export function createVisualizer(cfg) {
     return {
         start() {
             attachWhenBody();
+            // 绘制循环无条件启动：无数据源时画基线，让「定位在工作、只差数据」可见
+            requestAnimationFrame(frame);
             initData();
             // 画布随时待命：找到锚点就显示（没有数据源时画基线示意）
             setTimeout(syncPosition, 1000);

@@ -1,6 +1,6 @@
 // EasyAudioVisualizer - BetterNCM/Chromatic 插件入口
 // 设计原则：任何一环失败都不能阻断启动——配置挂起也照常启动可视化
-import { loadConfig, buildPanel } from './config.js';
+import { loadConfig, buildPanel, DEFAULTS } from './config.js';
 import { createVisualizer } from './visualizer.js';
 
 const TAG = '[EasyAudioVisualizer]';
@@ -49,20 +49,6 @@ function whenBody(cb) {
 }
 
 const cfg = {}; // 活对象：先默认值启动，配置到达后原地更新
-const DEFAULTS = {
-    sampleRate: '',
-    fftSize: '1024',
-    startFrequency: '150',
-    endFrequency: '4500',
-    outBandsQty: '81',
-    tWeight: '1',
-    aWeight: '1',
-    filterOn: '1',
-    sigma: '1',
-    radius: '2',
-    multiFFT: '0',
-    maxHeight: '120'
-};
 Object.assign(cfg, DEFAULTS);
 
 let viz = null;
