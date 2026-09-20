@@ -67,6 +67,7 @@ Object.assign(cfg, DEFAULTS);
 
 let viz = null;
 let booted = false;
+let panel = null;
 
 function boot() {
     if (booted) return;
@@ -93,20 +94,38 @@ loadConfig().then(real => {
     writeBootMarker({ phase: 'config-error', error: String(e) });
 });
 
-// 兼容 BetterNCM 生命周期（若 onLoad 被调用则再次确保启动）
+// 兼容 BetterNCM 生命周期：正确用法是「调用 plugin.onLoad/onConfig 注册回调」
+// （PluginMarket/LFP 均如此）。直接赋值会覆盖运行时的注册函数，
+// 导致插件管理器查不到配置页注册记录而把插件置灰。
 const pluginRef = typeof plugin !== 'undefined' ? plugin : (window.plugin = window.plugin || {});
-pluginRef.onLoad = function () {
+
+function safeRegister(name, cb) {
+    const fn = pluginRef[name];
+    if (typeof fn === 'function' && !fn.__eavAssigned) {
+        try {
+            fn.call(pluginRef, cb);
+            return 'registered';
+        } catch (e) { /* 落到赋值兜底 */ }
+    }
+    cb.__eavAssigned = true;
+    pluginRef[name] = cb;
+    return 'assigned';
+}
+
+safeRegister('onLoad', function () {
     whenBody(boot);
-};
-pluginRef.onConfig = function () {
+});
+
+safeRegister('onConfig', function () {
     if (!viz) {
         const tip = document.createElement('div');
         tip.setAttribute('style', 'padding:12px;font-size:13px;');
         tip.textContent = 'EasyAudioVisualizer 正在初始化...';
         return tip;
     }
-    return buildPanel(cfg, viz);
-};
+    if (!panel) panel = buildPanel(cfg, viz);
+    return panel;
+});
 
 // 调试入口
 window.EasyAudioVisualizer = {
