@@ -1,0 +1,11 @@
+# BetterNCM 插件市场打包过滤（格式类似 .gitignore）
+# 市场同步仓库目录生成插件包，以下文件不属于插件运行所需
+src/
+build.mjs
+package.json
+package-lock.json
+node_modules/
+README.md
+LICENSE
+.gitignore
+.betterncm-ignore
