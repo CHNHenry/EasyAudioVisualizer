@@ -17,7 +17,8 @@ export class MultiResolutionFFT {
             outBandsQty,
             tWeight = true,
             aWeight = true,
-            tiers = [8192, 2048, 512]
+            tiers = [8192, 2048, 512],
+            splits = null // [低/中分界, 中/高分界]：按频带中心频率指派支路；null 则按带宽自动选择
         } = options;
 
         if (!sampleRate || !outBandsQty) {
@@ -53,12 +54,19 @@ export class MultiResolutionFFT {
             const upper = Math.min(lower * ratio, endFrequency);
             const width = upper - lower;
 
-            // 从最快的支路（fftSize 最小）往回找第一条满足「bin宽 ≤ 带宽」的支路
+            // 指派支路：splits 存在时按中心频率落到低/中/高段；否则从最快支路往回取满足频宽的第一条
             let tierIndex = 0;
-            for (let t = tiers.length - 1; t >= 1; t--) {
-                if (binWidths[t] <= width) {
-                    tierIndex = t;
-                    break;
+            if (splits) {
+                const cf = Math.sqrt(lower * upper);
+                if (cf > splits[1]) tierIndex = 2;       // 高频段
+                else if (cf > splits[0]) tierIndex = 1;  // 中频段
+                // 默认 0（低频段）
+            } else {
+                for (let t = tiers.length - 1; t >= 1; t--) {
+                    if (binWidths[t] <= width) {
+                        tierIndex = t;
+                        break;
+                    }
                 }
             }
 
@@ -82,6 +90,30 @@ export class MultiResolutionFFT {
         // 每条频带独立的 5 帧时间计权历史
         this.history = [];
         for (let i = 0; i < outBandsQty; i++) this.history.push([]);
+
+        // 接缝平滑权重：α 在支路切换边界处为 1，向两侧 W 个频带线性衰减到 0
+        // 边界处输出 = 50% 自身 + 50% 邻域均值，消除段间接缝的断崖
+        const SEAM_W = 4;
+        this.seamAlpha = new Float32Array(outBandsQty);
+        {
+            const dist = new Array(outBandsQty).fill(Infinity);
+            for (let i = 1; i < outBandsQty; i++) {
+                if (this.bands[i].tierIndex !== this.bands[i - 1].tierIndex) {
+                    for (let k = 0; k < SEAM_W; k++) {
+                        if (i - 1 - k >= 0) dist[i - 1 - k] = Math.min(dist[i - 1 - k], k);
+                        if (i + k < outBandsQty) dist[i + k] = Math.min(dist[i + k], k);
+                    }
+                }
+            }
+            for (let i = 0; i < outBandsQty; i++) {
+                this.seamAlpha[i] = dist[i] === Infinity ? 0 : 1 - dist[i] / SEAM_W;
+            }
+        }
+
+        // 帧级缓冲复用：process 每帧调用，避免反复分配
+        this._vals = new Float64Array(outBandsQty);
+        this._blended = new Float64Array(outBandsQty);
+        this._out = new Array(outBandsQty);
     }
 
     // 支路分配统计：counts[支路序号] = 频带数；crossings = 支路切换处的起始频率
@@ -101,8 +133,10 @@ export class MultiResolutionFFT {
     }
 
     // inputs: 与 tiers 一一对应的 Uint8Array（各支路 getByteFrequencyData 的结果）
+    // 返回复用的内部缓冲（调用方当帧消费，不得跨帧持有）
     process(inputs) {
-        const out = new Array(this.outBandsQty);
+        // 第一遍：各频带取均方值 + 接缝校准 + A计权
+        const vals = this._vals;
         for (let i = 0; i < this.outBandsQty; i++) {
             const band = this.bands[i];
             const data = inputs[band.tierIndex];
@@ -120,6 +154,30 @@ export class MultiResolutionFFT {
 
             if (this.aWeight) v *= band.aw;
 
+            vals[i] = v;
+        }
+
+        // 第二遍：接缝平滑（在时间计权之前，边界处混入邻域均值消除断崖）
+        const n = this.outBandsQty;
+        const blended = this._blended;
+        for (let i = 0; i < n; i++) {
+            const a = this.seamAlpha[i];
+            if (a <= 0) {
+                blended[i] = vals[i];
+                continue;
+            }
+            // 邻域均值：±2 频带（越界钳制）
+            const i0 = Math.max(0, i - 2), i1 = Math.min(n - 1, i + 2);
+            let avg = 0;
+            for (let j = i0; j <= i1; j++) avg += vals[j];
+            avg /= i1 - i0 + 1;
+            blended[i] = vals[i] * (1 - a * 0.5) + avg * (a * 0.5);
+        }
+
+        // 第三遍：时间计权
+        const out = this._out;
+        for (let i = 0; i < n; i++) {
+            let v = blended[i];
             if (this.tWeight) {
                 const h = this.history[i];
                 h.push(v);
@@ -128,7 +186,6 @@ export class MultiResolutionFFT {
                 for (let j = 0; j < h.length; j++) sum += h[j];
                 v = sum / h.length;
             }
-
             out[i] = v;
         }
         return out;

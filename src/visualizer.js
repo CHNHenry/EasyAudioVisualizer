@@ -17,12 +17,19 @@ function detectLFP() {
         && typeof loadedPlugins.LibFrontendPlay.getFFTData === 'function';
 }
 
+// 找当前合适的媒体元素：优先正在播放的（NCM 页面上可能存在多个 audio，
+// 抓到不播放的那个会导致「有音频图但永远零数据」）
+function pickMedia() {
+    const list = Array.from(document.querySelectorAll('audio,video'));
+    return list.find(el => !el.paused && !el.ended) || list[0] || null;
+}
+
 function waitForMedia() {
     return new Promise(resolve => {
-        const found = document.querySelector('audio,video');
+        const found = pickMedia();
         if (found) return resolve(found);
         const obs = new MutationObserver(() => {
-            const el = document.querySelector('audio,video');
+            const el = pickMedia();
             if (el) {
                 obs.disconnect();
                 resolve(el);
@@ -39,13 +46,24 @@ export function createVisualizer(cfg) {
         analyser: null,
         tierAnalysers: null,
         tierBuffers: null,
+        tierSizes: null, // 当前支路 fftSize 配置（变化时重建支路）
         processor: null,
         multiProcessor: null,
         raw: null,
         anchor: null,
         anchorMode: null,
+        colorEl: null, // 最近一次的大进度条滑条元素（取色用，播放页外仍复用）
+        colorElSmall: null, // 小进度条（底部播放栏滑条）元素
+        accentBig: null,   // 大进度条主题色 [r,g,b]
+        accentSmall: null, // 小进度条主题色 [r,g,b]
         dataSource: null, // 'lfp' | 'element'
+        el: null, // 当前接管的媒体元素（元素模式；自愈与统计用）
         lfp: null,
+        lfpSr: null,  // LFP 懒构建时记录的采样率（参数变化时用于重建）
+        lfpFft: 0,    // LFP 懒构建时记录的 fftSize
+        compGain: null, // LFP 音量补偿节点
+        tapNode: null,  // 分体支路挂接点（补偿节点或源本身）
+        multiDisabled: false, // LFP 分体支路异常时自动降级为单路
         frames: 0,
         maxHeight: parseFloat(cfg.maxHeight) || 120,
         lastSum: -1 // 停顿时跳过重绘
@@ -65,6 +83,39 @@ export function createVisualizer(cfg) {
     canvas.style.width = '100%';
     canvas.style.height = '100%';
     wrap.appendChild(canvas);
+    const ctx2d = canvas.getContext('2d'); // 上下文缓存：避免每帧重复获取
+
+    // 频带级高斯平滑（multiFFT 输出没有走 SoundProcessor 的滤波管线，在此补齐）。
+    // 高斯核按 sigma/radius 缓存，参数不变时零重算
+    let gaussCache = { key: '', kern: null, sum: 0 };
+    function gaussSmooth(arr) {
+        const s = Math.max(0.1, parseFloat(cfg.sigma) || 1);
+        const r = Math.max(0, Math.round(parseFloat(cfg.radius) || 0));
+        if (!r || !arr || !arr.length) return arr;
+        const key = s + '/' + r;
+        if (gaussCache.key !== key) {
+            const kern = [];
+            let sum = 0;
+            for (let i = -r; i <= r; i++) {
+                const w = Math.exp(-(i * i) / (2 * s * s));
+                kern.push(w);
+                sum += w;
+            }
+            gaussCache = { key, kern, sum };
+        }
+        const { kern, sum } = gaussCache;
+        const n = arr.length;
+        const out = new Uint8Array(n);
+        for (let i = 0; i < n; i++) {
+            let acc = 0;
+            for (let k = -r; k <= r; k++) {
+                const j = Math.min(n - 1, Math.max(0, i + k));
+                acc += arr[j] * kern[k + r];
+            }
+            out[i] = Math.round(acc / sum);
+        }
+        return out;
+    }
 
     function attachWhenBody() {
         if (document.body) {
@@ -100,7 +151,15 @@ export function createVisualizer(cfg) {
         if (playSlider) {
             const rect = playSlider.getBoundingClientRect();
             if (rect.width > vw * 0.3 && rect.height > 2 && rect.top > vh * 0.5) {
-                return { rect, mode: 'playpage-slider-vinyl' };
+                return { rect, mode: 'playpage-slider-vinyl', el: playSlider };
+            }
+            // 页面上可能有多个 slider-vinyl（底部迷你条也是），挑几何特征符合播放页的那个
+            const all = document.querySelectorAll('[class*="slider-vinyl"]');
+            for (const s of all) {
+                const r = s.getBoundingClientRect();
+                if (r.width > vw * 0.3 && r.height > 2 && r.top > vh * 0.5) {
+                    return { rect: r, mode: 'playpage-slider-vinyl', el: s };
+                }
             }
         }
         const playPage = document.querySelector('.g-singlec-ct, .g-playpage, [class*="playpage" i], #playpage');
@@ -123,6 +182,8 @@ export function createVisualizer(cfg) {
         }
 
         // 2) 底部播放栏（NCM3）：频谱贴着播放栏上沿
+        // playPageOnly 开启时只在播放页显示，跳过以下所有兜底
+        if (cfg.playPageOnly === '1') return null;
         const bottomBar = document.querySelector('[class*="DefaultBarWrapper_"], #main-player, .g-btmbar');
         if (bottomBar) {
             const rect = bottomBar.getBoundingClientRect();
@@ -147,29 +208,59 @@ export function createVisualizer(cfg) {
         return null;
     }
 
+    // 数据源自愈（500ms 心跳）：接管的元素被移出 DOM、页面上出现真正播放中的
+    // 其他元素、或 LFP 被卸载时，自动切换/重挂数据源
+    function ensureDataSource() {
+        if (state.dataSource === 'element') {
+            const best = pickMedia();
+            if (!state.el || !state.el.isConnected
+                || (best && best !== state.el && !best.paused && state.el.paused)) {
+                resetToElementSource();
+            }
+        } else if (state.dataSource === 'lfp' && !detectLFP()) {
+            resetToElementSource();
+        }
+    }
+
     function syncPosition() {
+        ensureDataSource();
         const found = findAnchor();
         if (!found) {
             if (wrap.style.display !== 'none') wrap.style.display = 'none';
             state.anchor = null;
             state.anchorMode = null;
+            // 播放页外也要继续跟踪主题色（切歌时进度条 CSS 变量仍在更新）
+            sampleProgressColor();
             return;
         }
         const rect = found.rect;
         state.anchor = rect;
         state.anchorMode = found.mode;
+        // 注意：state.colorEl 是大进度条（播放页滑条）的取色缓存，不能被锚点元素覆盖，
+        // 否则底部栏锚点会把主题红当成封面色读进去
+        // 取色与锚点解耦：无论是否在播放页，都通过缓存的滑条元素跟踪主题色
+        sampleProgressColor();
         // 样式仅在变化时写入，避免无谓的样式重算
         const left = Math.round(rect.left);
         const width = Math.round(rect.width);
-        const bottom = Math.max(0, Math.round(window.innerHeight - rect.top + 2));
+        // 底边与进度条顶边对齐；yOffset 仅在播放页锚点生效（用于微调播放页的偏差）
+        const yo = found.mode.indexOf('playpage') === 0 ? (parseFloat(cfg.yOffset) || 0) : 0;
+        const bottom = Math.max(0, Math.round(window.innerHeight - rect.top - yo));
         if (wrap.style.display !== 'block') {
             wrap.style.display = 'block';
             wrap.style.height = state.maxHeight + 'px';
-            syncSize();
+            wrap._h = state.maxHeight;
+        }
+        // maxHeight 被配置异步更新时（重载后配置晚到），同步容器高度
+        if (wrap._h !== state.maxHeight) {
+            wrap.style.height = state.maxHeight + 'px';
+            wrap._h = state.maxHeight;
         }
         if (wrap._left !== left) { wrap.style.left = left + 'px'; wrap._left = left; }
         if (wrap._width !== width) { wrap.style.width = width + 'px'; wrap._width = width; }
         if (wrap._bottom !== bottom) { wrap.style.bottom = bottom + 'px'; wrap._bottom = bottom; }
+        // 位图尺寸必须在宽高样式就位后同步，否则首帧会用 0 宽位图拉伸导致模糊
+        syncSize();
     }
 
     // ---------- 数据源 A：LibFrontendPlay ----------
@@ -180,20 +271,52 @@ export function createVisualizer(cfg) {
     }
 
     // ---------- 数据源 B：接管 audio 元素 ----------
+    // 分体支路挂接点：LFP 模式下挂在音量补偿节点上，audio 元素模式直接挂源
     function ensureTierAnalysers() {
         if (state.tierAnalysers) return;
-        state.tierAnalysers = [8192, 2048, 512].map(size => {
+        const tap = state.tapNode || state.source;
+        const sizes = state.tierSizes || [8192, 2048, 512];
+        state.tierAnalysers = sizes.map(size => {
             const an = state.ac.createAnalyser();
             an.fftSize = size;
-            state.source.connect(an);
+            tap.connect(an);
             return an;
         });
         state.tierBuffers = state.tierAnalysers.map(an => new Uint8Array(an.frequencyBinCount));
     }
 
+    // ---------- multiFFT 定制（低/中/高分界线与各支路 fftSize） ----------
+    const FFT_SIZES = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
+    function cfgTierSizes() {
+        const size = (k, d) => {
+            const v = parseInt(cfg[k], 10);
+            return FFT_SIZES.includes(v) ? v : d;
+        };
+        return [size('mfLowFft', 8192), size('mfMidFft', 2048), size('mfHighFft', 512)];
+    }
+    function cfgSplits() {
+        const lo = parseFloat(cfg.mfLowMid);
+        const hi = parseFloat(cfg.mfMidHigh);
+        return Number.isFinite(lo) && Number.isFinite(hi) && lo > 0 && hi > lo ? [lo, hi] : null;
+    }
+    function multiOptions(sampleRate) {
+        return { ...makeParams(sampleRate), tiers: cfgTierSizes(), splits: cfgSplits() };
+    }
+    // 支路 fftSize 变化时重建支路 analyser
+    function syncTierSizes(sizes) {
+        if (state.tierAnalysers && state.tierAnalysers.some((an, i) => an.fftSize !== sizes[i])) {
+            state.tierAnalysers.forEach(an => { try { an.disconnect(); } catch (e) { /* 忽略 */ } });
+            state.tierAnalysers = null;
+            state.tierBuffers = null;
+        }
+        state.tierSizes = sizes;
+    }
+
     function hookElement(audio) {
+        if (state.dataSource === 'element' && state.el === audio && state.ac) return;
         state.ac = new AC();
-        // MediaElementSource 接管 audio 输出，必须连回 destination 才有声音
+        // MediaElementSource 接管 audio 输出，必须连回 destination 才有声音。
+        // 注意：同一元素只能 createMediaElementSource 一次，重挂只允许发生在不同元素间
         state.source = state.ac.createMediaElementSource(audio);
         state.analyser = state.ac.createAnalyser();
         state.source.connect(state.analyser);
@@ -201,34 +324,69 @@ export function createVisualizer(cfg) {
         audio.addEventListener('play', () => {
             state.ac.resume();
         });
+        state.el = audio;
         state.dataSource = 'element';
         console.info(TAG, 'data source = audio element, sampleRate =', state.ac.sampleRate);
         rebuild();
     }
 
-    // ---------- 数据源协商 ----------
-    async function initData() {
-        // 1) LFP（插件加载顺序不定，轮询等待；检测是属性访问，零开销）
-        const t0 = Date.now();
-        while (Date.now() - t0 < 20000) {
-            if (detectLFP()) {
-                useLFP();
-                return;
-            }
-            await delay(1000);
-        }
-        // 2) 页面媒体元素（NCM2 或装了同类前端播放插件时存在）
-        const el = await waitForMedia();
-        try {
+    // 数据源复位：拆除旧音频图后回退到元素模式（LFP 被卸载/元素被替换时调用）
+    function resetToElementSource() {
+        if (state.ac) { try { state.ac.close(); } catch (e) { /* 忽略 */ } }
+        state.ac = null;
+        state.source = null;
+        state.analyser = null;
+        state.tierAnalysers = null;
+        state.tierBuffers = null;
+        state.processor = null;
+        state.multiProcessor = null;
+        state.compGain = null;
+        state.tapNode = null;
+        state.lfp = null;
+        state.dataSource = null;
+        state.lastSum = -1;
+        const el = pickMedia();
+        if (el) {
             hookElement(el);
+        } else {
+            waitForMedia().then(next => {
+                if (state.dataSource !== 'element') hookElement(next);
+            });
+        }
+    }
+
+    // ---------- 数据源协商 ----------
+    // LFP 轮询 + audio 元素监听并行：LFP 优先，元素模式兜底（不装 LibFrontendPlay
+    // 也能工作）。元素出现在 LFP 加载完成之前时先等一个宽限期再接管——
+    // MediaElementSource 每个元素只能创建一次，抢先会让 LFP 挂接失败
+    async function initData() {
+        const mediaPromise = waitForMedia().then(async el => {
+            for (let i = 0; i < 5 && !detectLFP(); i++) await delay(500);
+            return { type: 'element', el };
+        });
+        const lfpPromise = (async () => {
+            while (!detectLFP()) {
+                if (state.dataSource) return null;
+                await delay(1000);
+            }
+            return { type: 'lfp' };
+        })();
+        const winner = await Promise.race([lfpPromise, mediaPromise]);
+        if (!winner) return;
+        if (winner.type === 'lfp') {
+            useLFP();
+            return;
+        }
+        try {
+            hookElement(winner.el);
         } catch (e) {
             console.error(TAG, 'hook audio failed', e);
         }
     }
 
     // ---------- 处理器重建（参数变化时调用） ----------
-    function buildProcessor(sampleRate, fftSize) {
-        const params = {
+    function makeParams(sampleRate) {
+        return {
             sampleRate,
             startFrequency: parseFloat(cfg.startFrequency) || 0,
             endFrequency: parseFloat(cfg.endFrequency) || 10000,
@@ -236,34 +394,66 @@ export function createVisualizer(cfg) {
             tWeight: cfg.tWeight === '1',
             aWeight: cfg.aWeight === '1'
         };
-        if (cfg.multiFFT === '1' && state.dataSource === 'element') {
-            ensureTierAnalysers();
+    }
+
+    function buildProcessor(sampleRate, fftSize) {
+        if (cfg.multiFFT === '1' && state.tierAnalysers) {
             state.processor = null;
-            state.multiProcessor = new MultiResolutionFFT(params);
-        } else {
-            state.multiProcessor = null;
-            if (state.analyser) {
-                state.analyser.fftSize = fftSize;
-            }
-            state.processor = new SoundProcessor({
-                ...params,
-                fftSize,
-                filterParams: cfg.filterOn === '1' ? {
-                    sigma: parseFloat(cfg.sigma) || 1,
-                    radius: Math.max(0, Math.round(parseFloat(cfg.radius) || 0))
-                } : undefined
-            });
+            state.multiProcessor = new MultiResolutionFFT(multiOptions(sampleRate));
+            return;
         }
+        state.multiProcessor = null;
+        if (state.analyser) {
+            state.analyser.fftSize = fftSize;
+        }
+        state.processor = new SoundProcessor({
+            ...makeParams(sampleRate),
+            fftSize,
+            filterParams: cfg.filterOn === '1' ? {
+                sigma: parseFloat(cfg.sigma) || 1,
+                radius: Math.max(0, Math.round(parseFloat(cfg.radius) || 0))
+            } : undefined
+        });
     }
 
     function rebuild() {
-        if (state.dataSource === 'lfp') return; // lfp 模式按实际数据长度懒构建
-        if (!state.ac) return;
-        const fftSize = parseInt(cfg.fftSize, 10) || 1024;
-        const sampleRate = cfg.sampleRate
-            ? parseFloat(cfg.sampleRate)
-            : state.ac.sampleRate;
         try {
+            if (state.dataSource === 'lfp') {
+                // LFP 分体：直接用当前挂接的 AudioContext 重建
+                if (cfg.multiFFT === '1') {
+                    state.multiDisabled = false; // 用户重新勾选时允许再次尝试
+                    if (state.ac) {
+                        state.processor = null;
+                        syncTierSizes(multiOptions(state.ac.sampleRate).tiers);
+                        ensureTierAnalysers();
+                        state.multiProcessor = new MultiResolutionFFT(multiOptions(state.ac.sampleRate));
+                    }
+                } else {
+                    // 关闭 multiFFT：无论如何先清掉分体处理器（multi 开着时 lfpSr 可能未记录，
+                    // 不清理会残留导致下方懒构建被跳过、频谱冻结）
+                    state.multiProcessor = null;
+                    if (state.lfpSr) {
+                        // fftSize 同步到 LFP 内部 analyser
+                        const want = parseInt(cfg.fftSize, 10) || 1024;
+                        const an = state.lfp.currentAudioAnalyser;
+                        if (an && an.fftSize !== want) {
+                            an.fftSize = want;
+                        }
+                        buildProcessor(state.lfpSr, state.lfpFft || want);
+                    }
+                    // lfpSr 未记录时走帧循环懒构建，自然用上新参数
+                }
+                return;
+            }
+            if (!state.ac) return;
+            const fftSize = parseInt(cfg.fftSize, 10) || 1024;
+            const sampleRate = cfg.sampleRate
+                ? parseFloat(cfg.sampleRate)
+                : state.ac.sampleRate;
+            if (cfg.multiFFT === '1') {
+                syncTierSizes(cfgTierSizes());
+                ensureTierAnalysers();
+            }
             buildProcessor(sampleRate, fftSize);
         } catch (e) {
             console.error(TAG, 'rebuild failed', e);
@@ -279,30 +469,114 @@ export function createVisualizer(cfg) {
     }
 
     // ---------- 绘制 ----------
+    // 进度条取色：大进度条（播放页 slider-vinyl，封面衍生彩色）与小进度条（底部播放栏
+    // slider-default[aria-label="播放进度调节"]，主题变量色）分别取 --track-color 的
+    // 最后一个不透明色标。两条取色均与锚点解耦：元素隐藏后只要还在 DOM 中就继续读色
+    // （getComputedStyle 对隐藏元素仍生效，var() 引用会解析成具体 rgb），切歌时 CSS
+    // 变量也会更新。显示时按当前锚点选目标色，绘制帧内逐帧插值，实现两色间的平滑过渡。
+    // 解析 --track-color：返回 [r,g,b] 或 null
+    function parseTrackColor(raw) {
+        if (!raw) return null;
+        const all = [...raw.matchAll(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/g)];
+        for (let i = all.length - 1; i >= 0; i--) {
+            if (!all[i][4] || parseFloat(all[i][4]) > 0.2) {
+                return [parseInt(all[i][1]), parseInt(all[i][2]), parseInt(all[i][3])];
+            }
+        }
+        return null;
+    }
+
+    // 大进度条：优先复用缓存的元素；丢失时重扫，跳过近白色（迷你条白系主题）
+    function findBigSlider() {
+        const all = document.querySelectorAll('[class*="slider-vinyl"]');
+        for (const s of all) {
+            const m = getComputedStyle(s).getPropertyValue('--track-color').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+            if (m && !(+m[1] >= 240 && +m[2] >= 240 && +m[3] >= 240)) return s;
+        }
+        return null;
+    }
+
+    // 小进度条：底部播放栏滑条（aria-label="播放进度调节"），精确选择器，
+    // 不做几何扫描（会误抓音量条等）。--track-color 引用主题 CSS 变量
+    // （如 var(--colorSecondary1_2)），getComputedStyle 返回解析后的具体 rgb
+    function findSmallSlider() {
+        return document.querySelector('[class*="slider-default"][aria-label*="进度"]')
+            || document.querySelector('[aria-label*="进度" i][class*="slider" i]');
+    }
+
+    function sampleProgressColor() {
+        // 大进度条
+        let big = state.colorEl;
+        if (!big || !big.isConnected) {
+            big = findBigSlider();
+            state.colorEl = big;
+        }
+        if (big) {
+            try {
+                state.accentBig = parseTrackColor(getComputedStyle(big).getPropertyValue('--track-color')) || state.accentBig;
+            } catch (e) { /* 元素已卸载等，忽略 */ }
+        }
+        // 小进度条
+        let small = state.colorElSmall;
+        if (!small || !small.isConnected) {
+            small = findSmallSlider();
+            state.colorElSmall = small;
+        }
+        if (small) {
+            try {
+                state.accentSmall = parseTrackColor(getComputedStyle(small).getPropertyValue('--track-color')) || state.accentSmall;
+            } catch (e) { /* 忽略 */ }
+        }
+    }
+
     function drawBars(data) {
-        const ctx = canvas.getContext('2d');
+        // 位图尺寸每帧自检：首帧若在窗口布局未稳时量错了尺寸，下一帧立即纠正
+        // （这也是「重载后改一下最大高度就判若两条」的根治）
+        syncSize();
+        const ctx = ctx2d;
         const w = canvas.width;
         const h = canvas.height;
         ctx.clearRect(0, 0, w, h);
         if (!data || !data.length) return;
 
         const bw = w / data.length;
+        const alpha = Math.min(1, Math.max(0.05, parseFloat(cfg.opacity) || 0.85));
+        const colorMode = cfg.colorMode === 'color';
+        const progressMode = cfg.colorMode === 'progress';
+        // 目标色：播放页锚点用大进度条色，否则用小进度条色；逐帧插值平滑过渡
+        const onPlayPage = state.anchorMode && state.anchorMode.indexOf('playpage') === 0;
+        const target = (onPlayPage ? state.accentBig : state.accentSmall)
+            || state.accentBig || state.accentSmall;
+        if (target) {
+            if (!state.accent) state.accent = target.slice();
+            for (let c = 0; c < 3; c++) {
+                state.accent[c] += (target[c] - state.accent[c]) * 0.08;
+            }
+        }
+        const accent = state.accent || [236, 65, 65]; // 兜底：NCM 主题红
         for (let i = 0; i < data.length; i++) {
             let v = data[i];
             if (!Number.isFinite(v)) v = 0; // 非法参数组合（如 startFrequency=0）兜底
             v = Math.min(255, Math.max(0, v));
             const t = v / 255;
             const bh = t * h;
-            ctx.fillStyle = `hsla(${200 + (i / data.length) * 160}, 80%, ${30 + t * 45}%, 1)`;
+            if (colorMode) {
+                ctx.fillStyle = `hsla(${200 + (i / data.length) * 160}, 80%, ${30 + t * 45}%, ${alpha})`;
+            } else if (progressMode) {
+                // 进度条颜色：亮度随响度变化（与白色模式同款辉光逻辑，色相取自进度条）
+                ctx.fillStyle = `rgba(${accent[0]}, ${accent[1]}, ${accent[2]}, ${alpha * (0.25 + 0.75 * t)})`;
+            } else {
+                // 白色模式：亮度随响度变化（辉光），静音处接近熄灭
+                ctx.fillStyle = `rgba(255, 255, 255, ${alpha * (0.25 + 0.75 * t)})`;
+            }
             ctx.fillRect(i * bw + 1, h - bh, Math.max(bw - 2, 1), bh);
         }
     }
 
     function drawBaseline() {
-        const ctx = canvas.getContext('2d');
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
-        ctx.fillRect(0, canvas.height - 3, canvas.width, 3);
+        ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+        ctx2d.fillStyle = 'rgba(255, 255, 255, 0.22)';
+        ctx2d.fillRect(0, canvas.height - 3, canvas.width, 3);
     }
 
     function frame() {
@@ -317,21 +591,85 @@ export function createVisualizer(cfg) {
 
         try {
             if (state.dataSource === 'lfp') {
-                const data = state.lfp.getFFTData();
-                if (data && data.length) {
-                    // LFP 的 analyser 未设置 fftSize（默认 2048），按实际数据长度懒构建
-                    if (!state.processor && !state.multiProcessor) {
-                        const sr = (state.lfp.currentAudioContext && state.lfp.currentAudioContext.sampleRate)
-                            || parseFloat(cfg.sampleRate) || 48000;
-                        buildProcessor(sr, data.length * 2);
-                    }
-                    // 停顿（全零）时跳过重绘
-                    let sum = 0;
-                    for (let i = 0; i < data.length; i += 8) sum += data[i];
-                    if (sum !== state.lastSum) {
-                        state.lastSum = sum;
-                        drawBars(state.processor.process(data));
+                // 分体 FFT：直接挂到 LFP 的 MediaElementSource 上取多分辨率数据
+                // （LFP 每首歌重建 AudioContext，检测到变化即自动重建支路）
+                const lfpAc = state.lfp.currentAudioContext;
+                if (cfg.multiFFT === '1' && !state.multiDisabled && lfpAc && state.lfp.currentAudioSource) {
+                    try {
+                        if (state.ac !== lfpAc || !state.multiProcessor) {
+                            // 换歌/换 AudioContext：显式断开旧节点（旧 AC 上的 analyser、
+                            // 增益节点不断开只能靠 GC 兜底，属隐性泄露）
+                            if (state.tierAnalysers) {
+                                state.tierAnalysers.forEach(an => { try { an.disconnect(); } catch (e) { /* 忽略 */ } });
+                            }
+                            if (state.compGain) { try { state.compGain.disconnect(); } catch (e) { /* 忽略 */ } }
+                            state.ac = lfpAc;
+                            state.source = state.lfp.currentAudioSource;
+                            // 音量补偿开关：播放器音量会衰减 MediaElementSource 输出（NCM 音量条），
+                            // 插入 1/音量 的增益补偿使分析电平与音量无关（对齐网页版）
+                            if (cfg.volumeComp === '1') {
+                                state.compGain = lfpAc.createGain();
+                                state.source.connect(state.compGain);
+                                state.tapNode = state.compGain;
+                            } else {
+                                state.compGain = null;
+                                state.tapNode = state.source;
+                            }
+                            state.tierAnalysers = null;
+                            state.tierBuffers = null;
+                            state.processor = null;
+                            syncTierSizes(multiOptions(lfpAc.sampleRate).tiers);
+                            ensureTierAnalysers();
+                            state.multiProcessor = new MultiResolutionFFT(multiOptions(lfpAc.sampleRate));
+                            state.lastSum = -1;
+                            console.info(TAG, 'multiFFT on LFP source, sampleRate =', lfpAc.sampleRate,
+                                'tiers =', state.tierSizes.join('/'), 'splits =', cfgSplits());
+                        }
+                        // 音量变化时同步补偿增益（上限 4 倍，防止静音附近爆表）
+                        if (cfg.volumeComp === '1' && state.compGain) {
+                            const vol = typeof state.lfp.volume === 'number' ? state.lfp.volume : 1;
+                            const gain = vol > 0.05 ? Math.min(4, 1 / vol) : 1;
+                            if (Math.abs(state.compGain.gain.value - gain) > 0.01) {
+                                state.compGain.gain.value = gain;
+                            }
+                        }
+                        for (let t = 0; t < state.tierAnalysers.length; t++) {
+                            state.tierAnalysers[t].getByteFrequencyData(state.tierBuffers[t]);
+                        }
+                        const bands = state.multiProcessor.process(state.tierBuffers);
+                        drawBars(cfg.filterOn === '1' ? gaussSmooth(bands) : bands);
                         state.frames++;
+                    } catch (e) {
+                        // 分体支路异常：降级回单路，保证频谱不消失
+                        state.multiDisabled = true;
+                        state.multiProcessor = null;
+                        console.error(TAG, 'multiFFT failed, fallback to single mode', e);
+                    }
+                } else {
+                    // 单路模式（multiDisabled 只阻止分体支路重试，不影响单路绘制）
+                    // fftSize 需要同步到 LFP 内部的 analyser（数据由它预先算好）
+                    const an = state.lfp.currentAudioAnalyser;
+                    const want = parseInt(cfg.fftSize, 10) || 1024;
+                    if (an && an.fftSize !== want) an.fftSize = want;
+                    const data = state.lfp.getFFTData();
+                    if (data && data.length) {
+                        // LFP 的 analyser 未设置 fftSize（默认 2048），按实际数据长度懒构建
+                        if (!state.processor) {
+                            state.multiProcessor = null;
+                            const sr = lfpAc ? lfpAc.sampleRate
+                                : (parseFloat(cfg.sampleRate) || 48000);
+                            state.lfpSr = sr;
+                            state.lfpFft = data.length * 2;
+                            buildProcessor(sr, state.lfpFft);
+                        }
+                        // 停顿（全零）时跳过重绘
+                        let sum = 0;
+                        for (let i = 0; i < data.length; i += 8) sum += data[i];
+                        if (sum !== state.lastSum) {
+                            state.lastSum = sum;
+                            drawBars(state.processor.process(data));
+                            state.frames++;
+                        }
                     }
                 }
             } else if (state.dataSource === 'element') {
@@ -339,7 +677,8 @@ export function createVisualizer(cfg) {
                     for (let t = 0; t < state.tierAnalysers.length; t++) {
                         state.tierAnalysers[t].getByteFrequencyData(state.tierBuffers[t]);
                     }
-                    drawBars(state.multiProcessor.process(state.tierBuffers));
+                    const bands = state.multiProcessor.process(state.tierBuffers);
+                    drawBars(cfg.filterOn === '1' ? gaussSmooth(bands) : bands);
                     state.frames++;
                 } else if (state.processor) {
                     const len = state.analyser.frequencyBinCount;
@@ -362,7 +701,9 @@ export function createVisualizer(cfg) {
         const m = state.multiProcessor;
         const stats = {
             source: state.dataSource,
+            elConnected: state.el ? state.el.isConnected : null,
             anchorMode: state.anchorMode,
+            accent: state.accent ? 'rgb(' + state.accent.join(',') + ')' : null,
             sampleRate: p ? p.sampleRate : (m ? m.sampleRate : null),
             fftSize: p ? p.fftSize : null,
             bandwidth: p ? (p.sampleRate / p.fftSize) : null,
@@ -378,6 +719,10 @@ export function createVisualizer(cfg) {
             const ts = m.tierStats();
             stats.tiers = m.tiers.map((s, i) => s + '×' + ts.counts[i] + '带');
             stats.crossings = ts.crossings.map(f => Math.round(f) + 'Hz');
+        }
+        if (state.dataSource === 'lfp' && typeof state.lfp.volume === 'number') {
+            stats.lfpVolume = state.lfp.volume;
+            stats.compGain = state.compGain ? +state.compGain.gain.value.toFixed(2) : null;
         }
         return stats;
     }

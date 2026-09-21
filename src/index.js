@@ -40,7 +40,13 @@ whenBody(boot);
 // 配置异步到达后原地更新
 loadConfig().then(real => {
     Object.assign(cfg, real);
-    if (viz) viz.rebuild();
+    if (viz) {
+        viz.rebuild();
+        // maxHeight 在 visualizer 创建时被快照进状态，配置晚到时必须显式应用
+        if (typeof viz.setMaxHeight === 'function') {
+            viz.setMaxHeight(parseFloat(cfg.maxHeight) || 120);
+        }
+    }
 }).catch(e => {
     console.error(TAG, 'config load failed', e);
 });
