@@ -1164,6 +1164,8 @@
       const mediaPromise = waitForMedia().then(async (el2) => {
         for (let i = 0; i < 5 && !detectLFP(); i++)
           await delay(500);
+        if (detectLFP())
+          return { type: "lfp" };
         return { type: "element", el: el2 };
       });
       const lfpPromise = (async () => {
@@ -1185,6 +1187,8 @@
         hookElement(winner.el);
       } catch (e) {
         console.error(TAG, "hook audio failed", e);
+        if (detectLFP())
+          useLFP();
       }
     }
     function makeParams(sampleRate) {

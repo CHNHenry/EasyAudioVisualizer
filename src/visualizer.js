@@ -361,7 +361,9 @@ export function createVisualizer(cfg) {
     // MediaElementSource 每个元素只能创建一次，抢先会让 LFP 挂接失败
     async function initData() {
         const mediaPromise = waitForMedia().then(async el => {
+            // 宽限期内 LFP 就绪则直接让位：抢先 createMediaElementSource 会让 LFP 挂接失败
             for (let i = 0; i < 5 && !detectLFP(); i++) await delay(500);
+            if (detectLFP()) return { type: 'lfp' };
             return { type: 'element', el };
         });
         const lfpPromise = (async () => {
@@ -381,6 +383,8 @@ export function createVisualizer(cfg) {
             hookElement(winner.el);
         } catch (e) {
             console.error(TAG, 'hook audio failed', e);
+            // 元素已被其他插件接管（createMediaElementSource 冲突）时回退 LFP
+            if (detectLFP()) useLFP();
         }
     }
 
