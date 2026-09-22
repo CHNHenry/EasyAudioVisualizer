@@ -7,10 +7,7 @@
 ## 特性
 
 - 频谱柱叠加在播放页进度条上方，左右无留白、自动跟随窗口与页面切换；也可退到底部播放栏上沿显示
-- **数据源自动协商，不强依赖任何插件**：
-  - 优先使用 [LibFrontendPlay](https://github.com/MicroCBer/LibFrontendPlay)（每首歌重建 AudioContext 时自动跟随，带音量电平补偿）
-  - 未安装 LibFrontendPlay 时自动接管 `<audio>` 元素（声音经分析回路原样连回扬声器，不影响播放）
-  - 元素被页面移除/替换时自动重新挂钩；运行时信息面板实时显示当前数据源
+- **依赖 [LibFrontendPlay](https://github.com/MicroCBer/LibFrontendPlay) 提供音频数据**（每首歌重建 AudioContext 时自动跟随，带音量电平补偿）；未就绪时频谱区域显示基线，其就绪/恢复后自动接入
 - 三种颜色模式：白色半透明（辉光随响度）/ 进度条颜色（读取播放页进度条的封面衍生填充色，随歌曲主题联动）/ 蓝紫红渐变
 - 全部信号处理参数可在插件设置页调整并持久化，改动即时生效（重建处理器，不中断播放）
 
@@ -26,7 +23,7 @@ BetterNCM 设置 → 插件管理 → 在线插件市场中搜索 `EasyAudioVisu
 2. 从 [Releases](https://github.com/CHNHenry/EasyAudioVisualizer/releases) 下载 `EasyAudioVisualizer.bmc`
 3. 将 `.bmc` 文件放进 BetterNCM 的 `plugins` 目录（或直接拖入网易云窗口）
 
-> 提示：LibFrontendPlay 不是必需依赖，但没有它时数据来自 audio 元素接管，音量较低时建议在设置页开启「音量电平补偿」以外的默认项即可。
+> 前置依赖：需先安装 [LibFrontendPlay](https://github.com/MicroCBer/LibFrontendPlay)，本插件从它读取 FFT 数据。
 
 ## 设置项说明
 
@@ -54,7 +51,7 @@ BetterNCM 设置 → 插件管理 → 在线插件市场中搜索 `EasyAudioVisu
 ## 已知限制
 
 - 插件通过启发式选择器定位播放页进度条，网易云音乐版本更新可能导致定位偏移；定位失败时自动退到主界面底部播放栏上方
-- 接管 audio 元素会替换原声输出通路（同一元素只能被接管一次），如遇声音异常可禁用本插件排查
+- 音频数据完全来自 LibFrontendPlay：其被禁用/卸载时频谱停在基线，不影响播放与发声
 - colorMode=progress 依赖播放页进度条滑条的 `--track-color` CSS 变量，NCM 更新样式结构后可能读不到（自动沿用最后一次取到的颜色）
 
 ## 开发
@@ -72,7 +69,7 @@ mklink /J "<BetterNCM数据目录>\plugins_dev\EasyAudioVisualizer" "<本仓库�
 
 ## 插件市场收录
 
-本插件已提交至 [BetterNCM 插件库](https://github.com/MicroCBer/betterncm-packed-plugins)（`plugins-list/easy-audio-visualizer.json` 指向本仓库）。市场脚本自动抓取 `manifest.json` 中的版本号，因此发布新版只需：更新版本号 → `npm run build` → 提交 `main.js` 与 `manifest.json` → 推送 → 打 Release。仓库内的 `.betterncm-ignore` 用于从打包结果中过滤源码等非运行时文件。
+本插件已提交至 [BetterNCM 插件库](https://github.com/BetterNCM/BetterNCM-Plugins)（`plugins-list/easy-audio-visualizer.json` 指向本仓库）。市场脚本自动抓取 `manifest.json` 中的版本号，因此发布新版只需：更新版本号 → `npm run build` → 提交 `main.js` 与 `manifest.json` → 推送 → 打 Release。仓库内的 `.betterncm-ignore` 用于从打包结果中过滤源码等非运行时文件。
 
 ## License
 

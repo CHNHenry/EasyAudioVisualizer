@@ -1,42 +1,15 @@
-// 可视化：数据源（LibFrontendPlay 优先 / audio 元素兜底）+ 播放页进度条上方频谱叠加
+// 可视化：数据源（依赖 LibFrontendPlay）+ 播放页进度条上方频谱叠加
 // 无任何调试 I/O：帧循环零 DOM 查询，定位走 500ms 低频心跳
 import { SoundProcessor } from './processor.js';
 import { MultiResolutionFFT } from './multi-fft.js';
 
-const AC = window.AudioContext || window.webkitAudioContext;
 const TAG = '[EasyAudioVisualizer]';
-
-function delay(ms) {
-    return new Promise(r => setTimeout(r, ms));
-}
 
 function detectLFP() {
     return typeof loadedPlugins !== 'undefined'
         && loadedPlugins
         && loadedPlugins.LibFrontendPlay
         && typeof loadedPlugins.LibFrontendPlay.getFFTData === 'function';
-}
-
-// 找当前合适的媒体元素：优先正在播放的（NCM 页面上可能存在多个 audio，
-// 抓到不播放的那个会导致「有音频图但永远零数据」）
-function pickMedia() {
-    const list = Array.from(document.querySelectorAll('audio,video'));
-    return list.find(el => !el.paused && !el.ended) || list[0] || null;
-}
-
-function waitForMedia() {
-    return new Promise(resolve => {
-        const found = pickMedia();
-        if (found) return resolve(found);
-        const obs = new MutationObserver(() => {
-            const el = pickMedia();
-            if (el) {
-                obs.disconnect();
-                resolve(el);
-            }
-        });
-        obs.observe(document.documentElement, { childList: true, subtree: true });
-    });
 }
 
 export function createVisualizer(cfg) {
@@ -49,15 +22,13 @@ export function createVisualizer(cfg) {
         tierSizes: null, // 当前支路 fftSize 配置（变化时重建支路）
         processor: null,
         multiProcessor: null,
-        raw: null,
         anchor: null,
         anchorMode: null,
         colorEl: null, // 最近一次的大进度条滑条元素（取色用，播放页外仍复用）
         colorElSmall: null, // 小进度条（底部播放栏滑条）元素
         accentBig: null,   // 大进度条主题色 [r,g,b]
         accentSmall: null, // 小进度条主题色 [r,g,b]
-        dataSource: null, // 'lfp' | 'element'
-        el: null, // 当前接管的媒体元素（元素模式；自愈与统计用）
+        dataSource: null, // 'lfp' | null（协商中/不可用）
         lfp: null,
         lfpSr: null,  // LFP 懒构建时记录的采样率（参数变化时用于重建）
         lfpFft: 0,    // LFP 懒构建时记录的 fftSize
@@ -208,17 +179,18 @@ export function createVisualizer(cfg) {
         return null;
     }
 
-    // 数据源自愈（500ms 心跳）：接管的元素被移出 DOM、页面上出现真正播放中的
-    // 其他元素、或 LFP 被卸载时，自动切换/重挂数据源
+    // 数据源自愈（500ms 心跳）：LFP 就绪即接入；被卸载时回到无数据源状态
+    // （画基线），其恢复后由下一拍心跳自动重建
     function ensureDataSource() {
-        if (state.dataSource === 'element') {
-            const best = pickMedia();
-            if (!state.el || !state.el.isConnected
-                || (best && best !== state.el && !best.paused && state.el.paused)) {
-                resetToElementSource();
-            }
-        } else if (state.dataSource === 'lfp' && !detectLFP()) {
-            resetToElementSource();
+        if (state.dataSource === 'lfp' && !detectLFP()) {
+            state.dataSource = null;
+            state.lfp = null;
+            state.processor = null;
+            state.multiProcessor = null;
+            state.multiDisabled = false;
+            console.warn(TAG, 'LibFrontendPlay 不可用，等待其恢复');
+        } else if (!state.dataSource && detectLFP()) {
+            useLFP();
         }
     }
 
@@ -270,8 +242,7 @@ export function createVisualizer(cfg) {
         console.info(TAG, 'data source = LibFrontendPlay.getFFTData()');
     }
 
-    // ---------- 数据源 B：接管 audio 元素 ----------
-    // 分体支路挂接点：LFP 模式下挂在音量补偿节点上，audio 元素模式直接挂源
+    // 分体支路挂接点：挂在音量补偿节点（或 LFP 源本身）上取多分辨率数据
     function ensureTierAnalysers() {
         if (state.tierAnalysers) return;
         const tap = state.tapNode || state.source;
@@ -312,80 +283,18 @@ export function createVisualizer(cfg) {
         state.tierSizes = sizes;
     }
 
-    function hookElement(audio) {
-        if (state.dataSource === 'element' && state.el === audio && state.ac) return;
-        state.ac = new AC();
-        // MediaElementSource 接管 audio 输出，必须连回 destination 才有声音。
-        // 注意：同一元素只能 createMediaElementSource 一次，重挂只允许发生在不同元素间
-        state.source = state.ac.createMediaElementSource(audio);
-        state.analyser = state.ac.createAnalyser();
-        state.source.connect(state.analyser);
-        state.analyser.connect(state.ac.destination);
-        audio.addEventListener('play', () => {
-            state.ac.resume();
-        });
-        state.el = audio;
-        state.dataSource = 'element';
-        console.info(TAG, 'data source = audio element, sampleRate =', state.ac.sampleRate);
-        rebuild();
-    }
-
-    // 数据源复位：拆除旧音频图后回退到元素模式（LFP 被卸载/元素被替换时调用）
-    function resetToElementSource() {
-        if (state.ac) { try { state.ac.close(); } catch (e) { /* 忽略 */ } }
-        state.ac = null;
-        state.source = null;
-        state.analyser = null;
-        state.tierAnalysers = null;
-        state.tierBuffers = null;
-        state.processor = null;
-        state.multiProcessor = null;
-        state.compGain = null;
-        state.tapNode = null;
-        state.lfp = null;
-        state.dataSource = null;
-        state.lastSum = -1;
-        const el = pickMedia();
-        if (el) {
-            hookElement(el);
-        } else {
-            waitForMedia().then(next => {
-                if (state.dataSource !== 'element') hookElement(next);
-            });
-        }
-    }
-
     // ---------- 数据源协商 ----------
-    // LFP 轮询 + audio 元素监听并行：LFP 优先，元素模式兜底（不装 LibFrontendPlay
-    // 也能工作）。元素出现在 LFP 加载完成之前时先等一个宽限期再接管——
-    // MediaElementSource 每个元素只能创建一次，抢先会让 LFP 挂接失败
-    async function initData() {
-        const mediaPromise = waitForMedia().then(async el => {
-            // 宽限期内 LFP 就绪则直接让位：抢先 createMediaElementSource 会让 LFP 挂接失败
-            for (let i = 0; i < 5 && !detectLFP(); i++) await delay(500);
-            if (detectLFP()) return { type: 'lfp' };
-            return { type: 'element', el };
-        });
-        const lfpPromise = (async () => {
-            while (!detectLFP()) {
-                if (state.dataSource) return null;
-                await delay(1000);
+    // 只依赖 LibFrontendPlay：轮询等待其 getFFTData 就绪（失联/恢复由心跳兜底）
+    function initData() {
+        const poll = () => {
+            if (state.dataSource === 'lfp') return;
+            if (detectLFP()) {
+                useLFP();
+                return;
             }
-            return { type: 'lfp' };
-        })();
-        const winner = await Promise.race([lfpPromise, mediaPromise]);
-        if (!winner) return;
-        if (winner.type === 'lfp') {
-            useLFP();
-            return;
-        }
-        try {
-            hookElement(winner.el);
-        } catch (e) {
-            console.error(TAG, 'hook audio failed', e);
-            // 元素已被其他插件接管（createMediaElementSource 冲突）时回退 LFP
-            if (detectLFP()) useLFP();
-        }
+            setTimeout(poll, 1000);
+        };
+        poll();
     }
 
     // ---------- 处理器重建（参数变化时调用） ----------
@@ -676,23 +585,6 @@ export function createVisualizer(cfg) {
                         }
                     }
                 }
-            } else if (state.dataSource === 'element') {
-                if (state.multiProcessor) {
-                    for (let t = 0; t < state.tierAnalysers.length; t++) {
-                        state.tierAnalysers[t].getByteFrequencyData(state.tierBuffers[t]);
-                    }
-                    const bands = state.multiProcessor.process(state.tierBuffers);
-                    drawBars(cfg.filterOn === '1' ? gaussSmooth(bands) : bands);
-                    state.frames++;
-                } else if (state.processor) {
-                    const len = state.analyser.frequencyBinCount;
-                    if (!state.raw || state.raw.length !== len) {
-                        state.raw = new Uint8Array(len);
-                    }
-                    state.analyser.getByteFrequencyData(state.raw);
-                    drawBars(state.processor.process(state.raw));
-                    state.frames++;
-                }
             }
         } catch (e) {
             console.error(TAG, 'frame error', e);
@@ -705,7 +597,6 @@ export function createVisualizer(cfg) {
         const m = state.multiProcessor;
         const stats = {
             source: state.dataSource,
-            elConnected: state.el ? state.el.isConnected : null,
             anchorMode: state.anchorMode,
             accent: state.accent ? 'rgb(' + state.accent.join(',') + ')' : null,
             sampleRate: p ? p.sampleRate : (m ? m.sampleRate : null),

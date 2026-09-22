@@ -13,7 +13,7 @@ export const DEFAULTS = {
     filterOn: '0',
     sigma: '1',
     radius: '2',
-    multiFFT: '1',       // 多分辨率分体（LFP 与 audio 元素模式均生效）
+    multiFFT: '1',       // 多分辨率分体
     maxHeight: '200',    // 柱形条群最大高度 px
     colorMode: 'white',  // 'white' 白色半透明 | 'progress' 进度条颜色 | 'color' 彩色
     opacity: '0.85',     // 柱形条不透明度 0.05~1
@@ -207,7 +207,7 @@ export function buildPanel(cfg, viz) {
     root.appendChild(style);
     root.appendChild(el('div', 'font-size:15px;font-weight:600;margin-bottom:8px;', 'EasyAudioVisualizer 设置'));
     root.appendChild(el('div', 'font-size:12px;opacity:.6;margin-bottom:10px;',
-        '所有参数即时生效（重建处理器，不影响播放）。数据源由运行环境自动协商（LibFrontendPlay 优先，audio 元素兜底）。'));
+        '所有参数即时生效（重建处理器，不影响播放）。音频数据来自 LibFrontendPlay 插件，请确保已安装并启用。'));
 
     // ---------- 运行时信息 ----------
     const statsBox = el('pre',
@@ -220,10 +220,9 @@ export function buildPanel(cfg, viz) {
         }
         try {
             const s = viz.getStats();
-            const srcName = { lfp: 'LibFrontendPlay', element: 'audio 元素' }[s.source] || '协商中';
+            const srcName = s.source === 'lfp' ? 'LibFrontendPlay' : '等待 LibFrontendPlay';
             const lines = [
-                '数据源: ' + srcName + (s.source === 'element' && s.elConnected === false ? '（元素已脱离 DOM，自动重挂中）' : '')
-                + '    锚点: ' + (s.anchorMode || '-') + '    绘制帧数: ' + s.frames,
+                '数据源: ' + srcName + '    锚点: ' + (s.anchorMode || '-') + '    绘制帧数: ' + s.frames,
                 '生效采样率: ' + (s.sampleRate || '-') + ' Hz    fftSize: ' + (s.fftSize || (s.multiFFT ? '按支路' : '-'))
                 + '    带宽: ' + (s.bandwidth ? s.bandwidth.toFixed(2) + ' Hz/点' : '-'),
                 '频段: ' + cfg.startFrequency + ' ~ ' + cfg.endFrequency + ' Hz    输出频带: ' + s.outBandsQty

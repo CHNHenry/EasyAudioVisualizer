@@ -14,7 +14,7 @@
     sigma: "1",
     radius: "2",
     multiFFT: "1",
-    // 多分辨率分体（LFP 与 audio 元素模式均生效）
+    // 多分辨率分体
     maxHeight: "200",
     // 柱形条群最大高度 px
     colorMode: "white",
@@ -230,7 +230,7 @@
     root.appendChild(el(
       "div",
       "font-size:12px;opacity:.6;margin-bottom:10px;",
-      "\u6240\u6709\u53C2\u6570\u5373\u65F6\u751F\u6548\uFF08\u91CD\u5EFA\u5904\u7406\u5668\uFF0C\u4E0D\u5F71\u54CD\u64AD\u653E\uFF09\u3002\u6570\u636E\u6E90\u7531\u8FD0\u884C\u73AF\u5883\u81EA\u52A8\u534F\u5546\uFF08LibFrontendPlay \u4F18\u5148\uFF0Caudio \u5143\u7D20\u515C\u5E95\uFF09\u3002"
+      "\u6240\u6709\u53C2\u6570\u5373\u65F6\u751F\u6548\uFF08\u91CD\u5EFA\u5904\u7406\u5668\uFF0C\u4E0D\u5F71\u54CD\u64AD\u653E\uFF09\u3002\u97F3\u9891\u6570\u636E\u6765\u81EA LibFrontendPlay \u63D2\u4EF6\uFF0C\u8BF7\u786E\u4FDD\u5DF2\u5B89\u88C5\u5E76\u542F\u7528\u3002"
     ));
     const statsBox = el(
       "pre",
@@ -244,9 +244,9 @@
       }
       try {
         const s = viz2.getStats();
-        const srcName = { lfp: "LibFrontendPlay", element: "audio \u5143\u7D20" }[s.source] || "\u534F\u5546\u4E2D";
+        const srcName = s.source === "lfp" ? "LibFrontendPlay" : "\u7B49\u5F85 LibFrontendPlay";
         const lines = [
-          "\u6570\u636E\u6E90: " + srcName + (s.source === "element" && s.elConnected === false ? "\uFF08\u5143\u7D20\u5DF2\u8131\u79BB DOM\uFF0C\u81EA\u52A8\u91CD\u6302\u4E2D\uFF09" : "") + "    \u951A\u70B9: " + (s.anchorMode || "-") + "    \u7ED8\u5236\u5E27\u6570: " + s.frames,
+          "\u6570\u636E\u6E90: " + srcName + "    \u951A\u70B9: " + (s.anchorMode || "-") + "    \u7ED8\u5236\u5E27\u6570: " + s.frames,
           "\u751F\u6548\u91C7\u6837\u7387: " + (s.sampleRate || "-") + " Hz    fftSize: " + (s.fftSize || (s.multiFFT ? "\u6309\u652F\u8DEF" : "-")) + "    \u5E26\u5BBD: " + (s.bandwidth ? s.bandwidth.toFixed(2) + " Hz/\u70B9" : "-"),
           "\u9891\u6BB5: " + cfg2.startFrequency + " ~ " + cfg2.endFrequency + " Hz    \u8F93\u51FA\u9891\u5E26: " + s.outBandsQty + "    \u500D\u9891\u7A0B\u500D\u7387: " + (s.sampleRate && s.outBandsQty ? Math.pow(2, Math.log2(Math.max(20, parseFloat(cfg2.endFrequency)) / Math.max(20, parseFloat(cfg2.startFrequency))) / s.outBandsQty).toFixed(4) : "-"),
           "\u9AD8\u65AF\u6EE4\u6CE2: " + s.filter + "    \u65F6\u95F4\u8BA1\u6743: " + (cfg2.tWeight === "1" ? "\u5F00" : "\u5173") + "    A\u8BA1\u6743: " + (cfg2.aWeight === "1" ? "\u5F00" : "\u5173") + "    \u67F1\u9AD8\u4E0A\u9650: " + s.maxHeight + "px"
@@ -833,32 +833,9 @@
   };
 
   // src/visualizer.js
-  var AC = window.AudioContext || window.webkitAudioContext;
   var TAG = "[EasyAudioVisualizer]";
-  function delay(ms) {
-    return new Promise((r) => setTimeout(r, ms));
-  }
   function detectLFP() {
     return typeof loadedPlugins !== "undefined" && loadedPlugins && loadedPlugins.LibFrontendPlay && typeof loadedPlugins.LibFrontendPlay.getFFTData === "function";
-  }
-  function pickMedia() {
-    const list = Array.from(document.querySelectorAll("audio,video"));
-    return list.find((el2) => !el2.paused && !el2.ended) || list[0] || null;
-  }
-  function waitForMedia() {
-    return new Promise((resolve) => {
-      const found = pickMedia();
-      if (found)
-        return resolve(found);
-      const obs = new MutationObserver(() => {
-        const el2 = pickMedia();
-        if (el2) {
-          obs.disconnect();
-          resolve(el2);
-        }
-      });
-      obs.observe(document.documentElement, { childList: true, subtree: true });
-    });
   }
   function createVisualizer(cfg2) {
     const state = {
@@ -871,7 +848,6 @@
       // 当前支路 fftSize 配置（变化时重建支路）
       processor: null,
       multiProcessor: null,
-      raw: null,
       anchor: null,
       anchorMode: null,
       colorEl: null,
@@ -883,9 +859,7 @@
       accentSmall: null,
       // 小进度条主题色 [r,g,b]
       dataSource: null,
-      // 'lfp' | 'element'
-      el: null,
-      // 当前接管的媒体元素（元素模式；自愈与统计用）
+      // 'lfp' | null（协商中/不可用）
       lfp: null,
       lfpSr: null,
       // LFP 懒构建时记录的采样率（参数变化时用于重建）
@@ -1017,13 +991,15 @@
       return null;
     }
     function ensureDataSource() {
-      if (state.dataSource === "element") {
-        const best = pickMedia();
-        if (!state.el || !state.el.isConnected || best && best !== state.el && !best.paused && state.el.paused) {
-          resetToElementSource();
-        }
-      } else if (state.dataSource === "lfp" && !detectLFP()) {
-        resetToElementSource();
+      if (state.dataSource === "lfp" && !detectLFP()) {
+        state.dataSource = null;
+        state.lfp = null;
+        state.processor = null;
+        state.multiProcessor = null;
+        state.multiDisabled = false;
+        console.warn(TAG, "LibFrontendPlay \u4E0D\u53EF\u7528\uFF0C\u7B49\u5F85\u5176\u6062\u590D");
+      } else if (!state.dataSource && detectLFP()) {
+        useLFP();
       }
     }
     function syncPosition() {
@@ -1115,81 +1091,17 @@
       }
       state.tierSizes = sizes;
     }
-    function hookElement(audio) {
-      if (state.dataSource === "element" && state.el === audio && state.ac)
-        return;
-      state.ac = new AC();
-      state.source = state.ac.createMediaElementSource(audio);
-      state.analyser = state.ac.createAnalyser();
-      state.source.connect(state.analyser);
-      state.analyser.connect(state.ac.destination);
-      audio.addEventListener("play", () => {
-        state.ac.resume();
-      });
-      state.el = audio;
-      state.dataSource = "element";
-      console.info(TAG, "data source = audio element, sampleRate =", state.ac.sampleRate);
-      rebuild();
-    }
-    function resetToElementSource() {
-      if (state.ac) {
-        try {
-          state.ac.close();
-        } catch (e) {
-        }
-      }
-      state.ac = null;
-      state.source = null;
-      state.analyser = null;
-      state.tierAnalysers = null;
-      state.tierBuffers = null;
-      state.processor = null;
-      state.multiProcessor = null;
-      state.compGain = null;
-      state.tapNode = null;
-      state.lfp = null;
-      state.dataSource = null;
-      state.lastSum = -1;
-      const el2 = pickMedia();
-      if (el2) {
-        hookElement(el2);
-      } else {
-        waitForMedia().then((next) => {
-          if (state.dataSource !== "element")
-            hookElement(next);
-        });
-      }
-    }
-    async function initData() {
-      const mediaPromise = waitForMedia().then(async (el2) => {
-        for (let i = 0; i < 5 && !detectLFP(); i++)
-          await delay(500);
-        if (detectLFP())
-          return { type: "lfp" };
-        return { type: "element", el: el2 };
-      });
-      const lfpPromise = (async () => {
-        while (!detectLFP()) {
-          if (state.dataSource)
-            return null;
-          await delay(1e3);
-        }
-        return { type: "lfp" };
-      })();
-      const winner = await Promise.race([lfpPromise, mediaPromise]);
-      if (!winner)
-        return;
-      if (winner.type === "lfp") {
-        useLFP();
-        return;
-      }
-      try {
-        hookElement(winner.el);
-      } catch (e) {
-        console.error(TAG, "hook audio failed", e);
-        if (detectLFP())
+    function initData() {
+      const poll = () => {
+        if (state.dataSource === "lfp")
+          return;
+        if (detectLFP()) {
           useLFP();
-      }
+          return;
+        }
+        setTimeout(poll, 1e3);
+      };
+      poll();
     }
     function makeParams(sampleRate) {
       return {
@@ -1452,23 +1364,6 @@
               }
             }
           }
-        } else if (state.dataSource === "element") {
-          if (state.multiProcessor) {
-            for (let t = 0; t < state.tierAnalysers.length; t++) {
-              state.tierAnalysers[t].getByteFrequencyData(state.tierBuffers[t]);
-            }
-            const bands = state.multiProcessor.process(state.tierBuffers);
-            drawBars(cfg2.filterOn === "1" ? gaussSmooth(bands) : bands);
-            state.frames++;
-          } else if (state.processor) {
-            const len = state.analyser.frequencyBinCount;
-            if (!state.raw || state.raw.length !== len) {
-              state.raw = new Uint8Array(len);
-            }
-            state.analyser.getByteFrequencyData(state.raw);
-            drawBars(state.processor.process(state.raw));
-            state.frames++;
-          }
         }
       } catch (e) {
         console.error(TAG, "frame error", e);
@@ -1479,7 +1374,6 @@
       const m = state.multiProcessor;
       const stats = {
         source: state.dataSource,
-        elConnected: state.el ? state.el.isConnected : null,
         anchorMode: state.anchorMode,
         accent: state.accent ? "rgb(" + state.accent.join(",") + ")" : null,
         sampleRate: p ? p.sampleRate : m ? m.sampleRate : null,
