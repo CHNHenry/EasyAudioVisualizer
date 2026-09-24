@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,minimum-scale=1,initial-scale=1,user-scalable=no" />
+    <title>EAV预览</title>
+<link href="./test.9c9bef35.css" rel="stylesheet"></head>
+
+<body>
+    <div class="layout">
+        <aside class="panel">
+            <h1>SoundProcessor 参数测试</h1>
+
+            <section class="group">
+                <div class="row">
+                    <label for="sourceSelect">音源</label>
+                    <select id="sourceSelect">
+                        <option value="file" selected>音乐文件</option>
+                        <option value="mic">麦克风</option>
+                        <option value="system">系统内录</option>
+                    </select>
+                </div>
+                <p class="hint">麦克风 / 系统内录只用于分析，不会回放到扬声器（避免啸叫）。系统内录仅 Chrome / Edge 支持：在弹出的共享窗口中选择“整个屏幕”或“标签页”，并勾选“分享音频”。</p>
+                <div class="btn-row">
+                    <button id="playBtn">▶ 播放</button>
+                    <label class="file-label">加载音频
+                        <input type="file" id="fileInput" accept="audio/*">
+                    </label>
+                    <button id="resetBtn">恢复默认</button>
+                </div>
+            </section>
+
+            <section class="group">
+                <h2>基础参数</h2>
+                <div class="row">
+                    <label for="sampleRate">sampleRate 采样率</label>
+                    <input id="sampleRate" type="number" min="8000" max="192000" step="100" placeholder="默认取AC" title="留空自动取 AudioContext 的真实采样率">
+                    <button class="info-btn" data-target="d-sampleRate" title="点击展开说明">?</button>
+                </div>
+                <div class="desc" id="d-sampleRate"><b>作用：</b>参与计算每个 FFT 频点的带宽（bandwidth = sampleRate ÷ fftSize），并把频率换算成频点索引来做倍频程分带，它不会改变真实采集到的数据。<b>效果：</b>留空自动取 AudioContext 的真实采样率（通常 48000），推荐保持默认。手动调大 → 每个频点被视为覆盖更宽的频率，同一频带分到的频点变少，输出整体偏低；调小则相反，输出偏高且频带错位。</div>
+                <div class="row">
+                    <label for="fftSize">fftSize</label>
+                    <select id="fftSize" title="FFT 窗口大小，决定频率分辨率">
+                        <option value="256">256</option>
+                        <option value="512">512</option>
+                        <option value="1024" selected>1024</option>
+                        <option value="2048">2048</option>
+                        <option value="4096">4096</option>
+                        <option value="8192">8192</option>
+                    </select>
+                    <button class="info-btn" data-target="d-fftSize" title="点击展开说明">?</button>
+                </div>
+                <div class="desc" id="d-fftSize"><b>作用：</b>FFT 窗口大小，决定频率分辨率（sampleRate ÷ fftSize ≈ 每个频点多少 Hz）与频点总数（fftSize ÷ 2），会同步设置 AnalyserNode。<b>效果：</b>越大，低频分得越细（4096 时约 11.7Hz/点），但每帧覆盖的时间窗更长，画面响应更迟缓；越小则响应快，但低频糊成一团。</div>
+                <div class="row">
+                    <label for="startFrequency">startFrequency (Hz)</label>
+                    <input id="startFrequency" type="number" min="0" step="10" value="150" title="倍频程划分的起始频率，不能为 0">
+                    <button class="info-btn" data-target="d-startFrequency" title="点击展开说明">?</button>
+                </div>
+                <div class="desc" id="d-startFrequency"><b>作用：</b>倍频程划分的起始频率，只取该频率以上的信号。<b>效果：</b>调高（如 1000+）可滤掉低频轰鸣与底噪，突出人声和旋律；调低则贝斯、底鼓更抢眼。注意不能填 0：库内用 log2(end ÷ start) 求倍率，填 0 会让输出全部变成 NaN（信息面板会给出警告）。</div>
+                <div class="row">
+                    <label for="endFrequency">endFrequency (Hz)</label>
+                    <input id="endFrequency" type="number" min="1" step="100" value="4500" title="倍频程划分的截止频率上限">
+                    <button class="info-btn" data-target="d-endFrequency" title="点击展开说明">?</button>
+                </div>
+                <div class="desc" id="d-endFrequency"><b>作用：</b>倍频程划分的截止频率上限。<b>效果：</b>调低可聚焦人声与鼓点等中低频，画面更有节奏感；调高会纳入镲片、气声等高频细节，但高频能量本身较弱（A计权后更弱），柱子通常很矮。README 建议一般音乐取 50~10000Hz 区间。</div>
+                <div class="row">
+                    <label for="outBandsQty">outBandsQty 输出频带数</label>
+                    <input id="outBandsQty" type="number" min="1" max="512" step="1" value="81" title="输出频带数 = 可视化目标数量">
+                    <button class="info-btn" data-target="d-outBandsQty" title="点击展开说明">?</button>
+                </div>
+                <div class="desc" id="d-outBandsQty"><b>作用：</b>输出频带数，即可视化目标数量（柱子数/圆点数）。程序按倍频程把 [start, end] 划成 N 个带，每个带的上限是下限的 2^(1/N) 倍。<b>效果：</b>越大 → 带宽窄、细节多，但单带能量弱、画面偏矮偏碎；越小 → 每带越宽、更有力度，适合少量大元素的风格。填得过大导致某些带超出 endFrequency 时，对应输出会是 0 或 NaN。</div>
+            </section>
+
+            <section class="group">
+                <h2>开关</h2>
+                <div class="row checkbox">
+                    <input id="tWeight" type="checkbox" checked>
+                    <label for="tWeight">tWeight 时间计权（5帧均值）</label>
+                    <button class="info-btn" data-target="d-tWeight" title="点击展开说明">?</button>
+                </div>
+                <div class="desc" id="d-tWeight"><b>作用：</b>时间计权，对最近 5 帧频谱取平均，抑制帧间突变（WebAudio 自带的 smoothingTimeConstant 只平均 2 帧且无法关闭）。<b>效果：</b>开启后波形随时间更平滑、有拖尾与呼吸感，鼓点瞬态被柔化，适合缓慢律动的视觉风格；关闭则逐帧忠实还原，跳动更硬朗、更带感。</div>
+                <div class="row checkbox">
+                    <input id="aWeight" type="checkbox" checked>
+                    <label for="aWeight">aWeight A计权</label>
+                    <button class="info-btn" data-target="d-aWeight" title="点击展开说明">?</button>
+                </div>
+                <div class="desc" id="d-aWeight"><b>作用：</b>A 计权（声学标准曲线），给每个频点乘一个系数，模拟人耳对 1~5kHz 最敏感、对低频与超高频不敏感的听觉特性。<b>效果：</b>开启后低频被压低、中频（人声区）突出，画面能量分布接近“听起来的响度”；关闭则是纯物理能量，低音很猛，但中频细节容易被低频淹没。</div>
+                <div class="row checkbox">
+                    <input id="filterOn" type="checkbox" checked>
+                    <label for="filterOn">filterParams 高斯滤波</label>
+                    <button class="info-btn" data-target="d-filterOn" title="点击展开说明">?</button>
+                </div>
+                <div class="desc" id="d-filterOn"><b>作用：</b>是否启用高斯滤波。WebAudio 已内置 blackman 窗做一次平滑，这里再补一层卷积滤波，目的纯粹是服务视觉效果。<b>效果：</b>开启后相邻频点的突刺被抹平，柱状图更圆润流畅；关闭则保留原始毛刺，画面更锐利，但可能有单根柱子突跳。</div>
+                <div class="row checkbox">
+                    <input id="multiFFT" type="checkbox">
+                    <label for="multiFFT">multiFFT 多分辨率分体（8192/2048/512）</label>
+                    <button class="info-btn" data-target="d-multiFFT" title="点击展开说明">?</button>
+                </div>
+                <div class="desc" id="d-multiFFT"><b>作用：</b>忽略上方 fftSize，改用 8192/2048/512 三条支路并行 FFT。每条倍频程频带自动挑选「带宽 ≥ 频点宽」中响应最快的支路——低频走 8192 求清晰、高频走 512 求迅速，近似恒Q变换（CQT）。开启后 fftSize 与高斯滤波不参与，时间计权/A计权仍生效（按频带粒度）。<b>效果：</b>低频各带彼此分开，贝斯与鼓点层次分明；高频保持约 21ms 的快速响应。代价：低频支路窗长约 170ms，低频响应天然偏钝；支路交叉处按 3dB/倍频程 做接缝校准（近似值）。运行时信息面板会显示每条支路分到的频带数与交叉点频率。</div>
+            </section>
+
+            <section class="group" id="filterGroup">
+                <h2>滤波参数 filterParams</h2>
+                <div class="row">
+                    <label for="sigma">sigma</label>
+                    <input id="sigma" type="number" min="0.1" max="250" step="0.1" value="1" title="高斯分布的 σ 参数，越大平滑越强">
+                    <button class="info-btn" data-target="d-sigma" title="点击展开说明">?</button>
+                </div>
+                <div class="desc" id="d-sigma"><b>作用：</b>高斯分布的 σ 参数，决定卷积核的形状，README 建议 0.1~250。<b>效果：</b>越大平滑越强——毛刺消失、峰变矮变宽；过大会把整条频谱抹成一条平缓曲线，细节尽失；0.1 左右几乎等于不滤波。</div>
+                <div class="row">
+                    <input id="sigmaRange" type="range" min="0.1" max="250" step="0.1" value="1">
+                </div>
+                <div class="row">
+                    <label for="radius">radius 滤波半径</label>
+                    <input id="radius" type="number" min="0" max="20" step="1" value="2" title="卷积核半径，核长 2×radius+1，0 相当于不滤波">
+                    <button class="info-btn" data-target="d-radius" title="点击展开说明">?</button>
+                </div>
+                <div class="desc" id="d-radius"><b>作用：</b>滤波半径，卷积核实际长度为 2×radius+1；radius 为 0 时相当于不滤波。<b>效果：</b>越大，参与平均的邻点越多、平滑范围越宽，峰值的延迟感与细节损失也越明显。</div>
+            </section>
+
+            <section class="group">
+                <h2>运行时信息</h2>
+                <pre id="stats"></pre>
+            </section>
+        </aside>
+
+        <main class="stage">
+            <div class="canvas-wrap">
+                <span class="tag">处理后（SoundProcessor.process 输出）</span>
+                <canvas id="canvas"></canvas>
+            </div>
+            <div class="canvas-wrap">
+                <span class="tag">原始（analyser.getByteFrequencyData）</span>
+                <canvas id="rawCanvas"></canvas>
+            </div>
+        </main>
+    </div>
+
+    <audio id="audio" crossorigin="anonymous"></audio>
+<script type="text/javascript">!function(f){function e(e){for(var r,n,t=e[0],o=e[1],u=e[2],i=0,l=[];i<t.length;i++)n=t[i],a[n]&&l.push(a[n][0]),a[n]=0;for(r in o)Object.prototype.hasOwnProperty.call(o,r)&&(f[r]=o[r]);for(s&&s(e);l.length;)l.shift()();return c.push.apply(c,u||[]),p()}function p(){for(var e,r=0;r<c.length;r++){for(var n=c[r],t=!0,o=1;o<n.length;o++){var u=n[o];0!==a[u]&&(t=!1)}t&&(c.splice(r--,1),e=i(i.s=n[0]))}return e}var n={},a={0:0},c=[];function i(e){if(n[e])return n[e].exports;var r=n[e]={i:e,l:!1,exports:{}};return f[e].call(r.exports,r,r.exports,i),r.l=!0,r.exports}i.m=f,i.c=n,i.d=function(e,r,n){i.o(e,r)||Object.defineProperty(e,r,{enumerable:!0,get:n})},i.r=function(e){"undefined"!=typeof Symbol&&Symbol.toStringTag&&Object.defineProperty(e,Symbol.toStringTag,{value:"Module"}),Object.defineProperty(e,"__esModule",{value:!0})},i.t=function(r,e){if(1&e&&(r=i(r)),8&e)return r;if(4&e&&"object"==typeof r&&r&&r.__esModule)return r;var n=Object.create(null);if(i.r(n),Object.defineProperty(n,"default",{enumerable:!0,value:r}),2&e&&"string"!=typeof r)for(var t in r)i.d(n,t,function(e){return r[e]}.bind(null,t));return n},i.n=function(e){var r=e&&e.__esModule?function(){return e.default}:function(){return e};return i.d(r,"a",r),r},i.o=function(e,r){return Object.prototype.hasOwnProperty.call(e,r)},i.p="./";var r=window.webpackJsonp=window.webpackJsonp||[],t=r.push.bind(r);r.push=e,r=r.slice();for(var o=0;o<r.length;o++)e(r[o]);var s=t;p()}([]);</script><script type="text/javascript" src="./test.75155b3e.js"></script></body>
+
+</html>
